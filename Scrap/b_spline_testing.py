@@ -6,7 +6,7 @@ from skfda.representation.basis import BSpline
 
 # --- 1. Load the .edf File ---
 # Replace 'your_file.edf' with your actual filename
-file_path = '/Users/kavya/Desktop/uni/research project/Kural EEG Dataset/S01.edf'
+file_path = '/Users/kavya/Documents/GitHub/Epilepsy-EEG-FDA/Kural (2020) Dataset/S02.edf'
 raw = mne.io.read_raw_edf(file_path, preload=True)
 
 # Let's pick a channel and a small window for the test (e.g., 2 seconds)
