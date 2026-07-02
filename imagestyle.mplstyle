@@ -1,0 +1,47 @@
+# Figure
+figure.figsize: 8, 5
+figure.dpi: 400
+figure.facecolor: white
+
+# Axes
+axes.facecolor: white
+axes.edgecolor: black
+axes.linewidth: 1
+axes.grid: True
+axes.axisbelow: True
+axes.titlesize: 16
+axes.labelsize: 14
+
+# Grid
+grid.color: lightgray
+grid.linestyle: --
+grid.linewidth: 0.5
+grid.alpha: 0.7
+
+# Lines
+lines.linewidth: 2
+lines.markersize: 6
+
+# Font
+font.family: serif
+font.serif: Times New Roman
+font.size: 12
+
+# Tick marks
+xtick.labelsize: 11
+ytick.labelsize: 11
+xtick.direction: in
+ytick.direction: in
+
+# Legend
+legend.frameon: False
+legend.fontsize: 11
+
+# Save figures
+savefig.dpi: 800
+savefig.bbox: tight
+savefig.format: png
+savefig.transparent: False
+
+# Error bars
+errorbar.capsize: 3
