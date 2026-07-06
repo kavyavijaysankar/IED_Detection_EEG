@@ -8,7 +8,7 @@ import pandas as pd
 from skfda import FDataGrid
 
 
-def load_manifest(csv_path):
+def load_CSV(csv_path):
     df = pd.read_csv(csv_path)
     usable = df[df["load_error"].isna() & (df["annotation_status"] == "ok")].copy()
     return usable.reset_index(drop=True)

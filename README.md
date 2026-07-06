@@ -15,8 +15,8 @@
 ### Notebooks — `notebooks/`
 
 - `EDA.ipynb` - exploratory data analysis
+- `classification_registered.ipynb` - 2s window classification with registration 
 - `classification.ipynb` - larger window classification without registration
-- `classification_registered.ipynb` - 2s window classification with registration
 
 ### `Scrap/` - trial and error
 
