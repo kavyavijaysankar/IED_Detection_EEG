@@ -1,0 +1,27 @@
+# Python 3.11
+# Core scientific stack, pinned to the versions this analysis was developed against.
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.3.3
+matplotlib==3.9.4
+scikit-learn==1.6.1
+xarray==2024.7.0
+
+# Functional data analysis
+scikit-fda==0.9.1
+fdasrsf==2.6.1
+dcor==0.6
+
+# EEG
+mne==1.8.0
+
+# Numba is pinned alongside llvmlite; they must stay in lockstep.
+numba==0.60.0
+llvmlite==0.43.0
+
+# Notebook environment
+jupyter==1.1.1
+jupyterlab==4.5.9
+ipykernel==6.31.0
+ipywidgets==8.1.8
+tqdm==4.67.3
