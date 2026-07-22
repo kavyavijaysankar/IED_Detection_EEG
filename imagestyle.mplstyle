@@ -1,6 +1,6 @@
 # Figure
 figure.figsize: 8, 5
-figure.dpi: 400
+figure.dpi: 800
 figure.facecolor: white
 
 # Axes
