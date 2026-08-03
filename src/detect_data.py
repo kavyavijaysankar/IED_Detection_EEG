@@ -20,14 +20,15 @@ CH19 = ['E C3-Ref', 'E C4-Ref', 'E Cz-Ref', 'E F3-Ref', 'E F4-Ref', 'E F7-Ref', 
         'E P7-Ref', 'E P8-Ref', 'E Pz-Ref', 'E T7-Ref', 'E T8-Ref']
 
 
-def load_recording(file_id, edf_dir, reference='recorded'):
-    """Full recording as (19, T) microvolt array over CH19.
+def load_recording_path(edf_path, reference='recorded'):
+    """Full recording as (19, T) microvolt array over CH19, from an EDF at an arbitrary path.
 
-    reference: 'recorded' (as-stored, single physical ref) | 'average' (common-average, for topography).
-    'bipolar' is deferred (needs an electrode-pair montage).
+    Use this for external/test EDFs (e.g. the supervisor's data). The file must contain the 19 standard
+    10-20 channels named as in Kural (`E Fp1-Ref`, ...) at 500 Hz.
+    reference: 'recorded' (as-stored) | 'average' (common-average); 'bipolar' deferred.
     """
-    raw = mne.io.read_raw_edf(str(Path(edf_dir) / f"{file_id}.edf"), preload=True, verbose=False)
-    assert raw.info['sfreq'] == SF, f"{file_id}: expected {SF} Hz, got {raw.info['sfreq']}"
+    raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
+    assert raw.info['sfreq'] == SF, f"{edf_path}: expected {SF} Hz, got {raw.info['sfreq']}"
     raw.pick(CH19)
     X = raw.get_data() * 1e6
     if reference == 'average':
@@ -37,6 +38,11 @@ def load_recording(file_id, edf_dir, reference='recorded'):
     elif reference != 'recorded':
         raise ValueError(f"unknown reference: {reference}")
     return X
+
+
+def load_recording(file_id, edf_dir, reference='recorded'):
+    """Full recording (19, T) µV for a `file_id` under `edf_dir`. See load_recording_path."""
+    return load_recording_path(Path(edf_dir) / f"{file_id}.edf", reference)
 
 
 def load_dataset(manifest, edf_dir, reference='recorded'):
