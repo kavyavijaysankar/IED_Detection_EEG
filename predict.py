@@ -2,9 +2,7 @@
 
     python predict.py <model.joblib> <recording.edf> [--score 0.5]
 
-Prints detected IED events above the score threshold: time (s), representative channel, score, and how
-many channels the event spanned. The EDF must contain the 19 standard 10-20 channels named as in the
-Kural data (`E Fp1-Ref`, ...) at 500 Hz — see detect_data.load_recording_path.
+Prints detected IED events above the score threshold: time (s), representative channel, score, and how many channels the event spanned. The EDF must contain the 19 standard 10-20 channels named as in the Kural data (`E Fp1-Ref`, ...) at 500 Hz — see detect_data.load_recording_path.
 """
 import argparse
 import sys

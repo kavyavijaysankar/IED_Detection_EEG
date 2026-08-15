@@ -69,15 +69,78 @@ class Stage1:
 class Consolidator:
     """L2: group per-channel candidates of the same spike into events via cross-correlation.
 
-    Greedy by sharpness: the sharpest unused candidate seeds an event; any nearby-in-time candidate on
-    another channel whose window correlates >= corr_threshold joins it. Events with < min_channels are
-    rejected (single-channel = artefact). Representative channel = max peak-to-peak over the window.
+    Two grouping rules (cfg.grouping), both using the same normalised/lag-searched/absolute correlation:
+      'greedy'      the sharpest unused candidate seeds an event and every other member must correlate
+                    with THAT SEED. Star-shaped.
+      'components'  single-linkage: candidates are nodes, "same spike" is an edge, events are connected
+                    components, so A~B and B~C put all three together even if A and C do not match.
+    Events with < min_channels distinct channels are rejected (single-channel = artefact). Representative
+    channel = max peak-to-peak over the correlation window, under either rule.
     """
 
     def __init__(self, cfg):
         self.cfg = cfg
 
     def consolidate(self, X, cands, stat):
+        if self.cfg.grouping == 'components':
+            return self._components(X, cands)
+        if self.cfg.grouping != 'greedy':
+            raise ValueError(f"unknown grouping: {self.cfg.grouping}")
+        return self._greedy(X, cands, stat)
+
+    def _components(self, X, cands):
+        """Single-linkage grouping: events are connected components of the 'same spike' graph.
+
+        A discharge's scalp field is a chain, not a star — across a dipole the morphology varies enough
+        that far channels match their neighbours but not the sharpest channel, so seed-relative grouping
+        splits one discharge into several events. Single-linkage does not. Candidates are swept in time
+        order and only pairs within coincidence_ms are tested; an edge is skipped when the two are already
+        connected, so this builds a spanning forest rather than the full graph.
+        """
+        cfg = self.cfg
+        ch_half = cfg.samp(cfg.corr_halfwin_ms)
+        coin = cfg.samp(cfg.coincidence_ms)
+        max_lag = cfg.samp(cfg.corr_max_lag_ms)
+        Xs = _smooth(X, cfg)
+        wins = [window_around(Xs[c], t, ch_half) for c, t in cands]
+        keep = [k for k, w in enumerate(wins) if w is not None]   # drop candidates at a recording edge
+        order = sorted(keep, key=lambda k: cands[k][1])
+
+        parent = list(range(len(cands)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        for pos, i in enumerate(order):
+            ci, ti = cands[i]
+            for j in order[pos + 1:]:
+                cj, tj = cands[j]
+                if tj - ti > coin:                                # time-sorted -> nothing further matches
+                    break
+                ri, rj = find(i), find(j)
+                if cj == ci or ri == rj:
+                    continue
+                if _norm_lag_corr(wins[i], wins[j], max_lag) >= cfg.corr_threshold:
+                    parent[rj] = ri
+
+        groups = {}
+        for k in keep:
+            groups.setdefault(find(k), []).append(k)
+        events = []
+        for ks in groups.values():
+            members = [cands[k] for k in ks]
+            chans = {c for c, _ in members}
+            if len(chans) < cfg.min_channels:
+                continue
+            rep = max(ks, key=lambda k: np.ptp(wins[k]))
+            events.append({'time': int(cands[rep][1]), 'channel': int(cands[rep][0]),
+                           'n_channels': len(chans), 'members': members})
+        return sorted(events, key=lambda e: e['time'])
+
+    def _greedy(self, X, cands, stat):
         cfg = self.cfg
         ch_half = cfg.samp(cfg.corr_halfwin_ms)
         coin = cfg.samp(cfg.coincidence_ms)
@@ -178,9 +241,33 @@ class Classifier:
         self._fpca = FPCA(n_components=self.cfg.n_components).fit(aligned)
         F = self._fpca.transform(aligned)
         self._scaler = StandardScaler().fit(F)
-        self._lr = LogisticRegression(C=self.cfg.lr_C, max_iter=1000,
-                                      class_weight='balanced').fit(self._scaler.transform(F), y)
+        Z = self._scaler.transform(F)
+        self._lr = self._fit_lr(Z, y)
+        if self.cfg.hard_neg_ratio:
+            self._lr = self._fit_lr(*self._mine(Z, y))
         return self
+
+    def _fit_lr(self, Z, y):
+        return LogisticRegression(C=self.cfg.lr_C, max_iter=1000,
+                                  class_weight='balanced').fit(Z, y)
+
+    def _mine(self, Z, y):
+        """Hard-negative mining: keep every positive but only the negatives the first pass ranks highest.
+
+        Training is ~64 positives against ~4300 negatives, nearly all of them easy — the LR spends its
+        capacity separating IEDs from background that was never going to be confused with one. Refitting
+        on the hardest negatives redraws the boundary where the false positives actually are.
+
+        Only the LR's training rows change: registration and FPCA stay fitted on everything, so the
+        representation is untouched (and stays unsupervised) and mining costs one logistic fit. Scores are
+        in-sample, the standard practice — and harmless for leakage, since this all happens strictly
+        inside whichever training set was handed to `fit`.
+        """
+        s = self._lr.predict_proba(Z)[:, 1]
+        pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
+        k = min(len(neg), int(round(self.cfg.hard_neg_ratio * max(len(pos), 1))))
+        keep = np.concatenate([pos, neg[np.argsort(-s[neg])[:k]]])
+        return Z[keep], y[keep]
 
     def predict_proba(self, windows):
         aligned = self._reg.transform(self._resample(windows))
@@ -272,18 +359,28 @@ def _demo():
     X[0] += bump(8, 3400)          # a lone single-channel spike -> must be rejected
 
     cands, stat = Stage1(cfg).detect(X)
-    events = Consolidator(cfg).consolidate(X, cands, stat)
+    for grouping in ('greedy', 'components'):
+        g = replace(cfg, grouping=grouping)
+        events = Consolidator(g).consolidate(X, cands, stat)
+        assert len(events) == 1, f"{grouping}: expected 1 event, got {len(events)}"
+        e = events[0]
+        assert e['n_channels'] == 2, f"{grouping}: IED should group 2 channels, got {e['n_channels']}"
+        assert abs(e['time'] - 2000) <= 15, f"{grouping}: event mislocated"
+        assert e['channel'] == 0, f"{grouping}: representative should be the largest-ptp channel (ch0)"
+        for mode in ('amplitude', 'sharpness'):
+            c = event_centre(X, e, replace(g, centre_on=mode), _smooth(X, cfg), stat)
+            assert abs(c - 2000) <= 15, f"{mode} centring mislocated ({c})"
+        print(f"detection demo OK ({grouping}): {len(cands)} candidates -> {len(events)} event "
+              f"(ch{e['channel']}, {e['n_channels']} channels, t={e['time']})")
 
-    assert len(events) == 1, f"expected 1 event, got {len(events)}"
-    e = events[0]
-    assert e['n_channels'] == 2, f"IED should group 2 channels, got {e['n_channels']}"
-    assert abs(e['time'] - 2000) <= 15, "event mislocated"
-    assert e['channel'] == 0, "representative should be the largest-ptp channel (ch0)"
-    for mode in ('amplitude', 'sharpness'):
-        c = event_centre(X, e, replace(cfg, centre_on=mode), _smooth(X, cfg), stat)
-        assert abs(c - 2000) <= 15, f"{mode} centring mislocated ({c})"
-    print(f"detection demo OK: {len(cands)} candidates -> {len(events)} event "
-          f"(ch{e['channel']}, {e['n_channels']} channels, t={e['time']})")
+    # hard-negative mining keeps every positive and only the ratio*n_pos highest-scoring negatives
+    c = Classifier(replace(cfg, hard_neg_ratio=2.0))
+    c._lr = type('L', (), {'predict_proba': staticmethod(lambda Z: np.c_[1 - Z[:, 0], Z[:, 0]])})()
+    Zt, yt = np.array([[0.9], [0.8], [0.7], [0.1], [0.95]]), np.array([0, 0, 0, 0, 1])
+    Zk, yk = c._mine(Zt, yt)
+    assert yk.sum() == 1 and len(yk) == 3, f"mining kept {len(yk)} rows, expected 1 pos + 2 neg"
+    assert sorted(Zk[yk == 0].ravel()) == [0.8, 0.9], "mining should keep the hardest negatives"
+    print("hard-negative mining demo OK")
 
 
 if __name__ == '__main__':
