@@ -114,6 +114,25 @@ def counts(ax, c, title='operating point'):
                  f"{c['fp_per_min']:.1f} FP/min", fontsize=8)
 
 
+def event_panel(ax, X, event, cfg, title='', halfwin_s=None):
+    """One event drawn for eyeballing: representative channel bold, other member channels faint.
+
+    The members are drawn too because the *field* is what separates a blink or a muscle burst from a
+    discharge — a single channel usually cannot be classified by eye. Raw µV, so panels are comparable
+    within a recording but not across them.
+    """
+    half = int(round((halfwin_s or cfg.classifier_halfwin_s) * cfg.sfreq))
+    c = int(event['time'])
+    lo, hi = max(0, c - half), min(X.shape[1], c + half)
+    t = (np.arange(lo, hi) - c) / cfg.sfreq
+    for ch in {m[0] for m in event['members']} - {event['channel']}:
+        ax.plot(t, X[ch, lo:hi], lw=0.5, color='0.75')
+    ax.plot(t, X[event['channel'], lo:hi], lw=1.0, color='C0')
+    ax.axvline(0, color='C3', lw=0.8, ls='--')
+    ax.set_title(title, fontsize=7)
+    ax.tick_params(labelsize=6)
+
+
 def loc_error(ax, errs, cfg):
     """Localisation error distribution — capped at hit_tol by construction, so state the cap."""
     ax.hist(errs, bins=np.arange(0, cfg.hit_tol_ms + 5, 5), color='C0', alpha=0.8)

@@ -21,6 +21,13 @@ def _tol(cfg):
     return cfg.samp(cfg.hit_tol_ms)
 
 
+def _bad(r):
+    """Interpolated channels for a recording — excluded from L1 candidate generation.
+
+    Empty when absent, so anything built before bad-channel handling existed still works."""
+    return r.get('bad_hard', ())
+
+
 def layer1_recall(pipe, recs):
     """Fraction of IEDs with an L1 candidate within +/-hit_tol of the marker (any channel)."""
     tol, hit, n = _tol(pipe.cfg), 0, 0
@@ -28,7 +35,7 @@ def layer1_recall(pipe, recs):
         if not r['epi']:
             continue
         n += 1
-        cands, _ = pipe.stage1.detect(r['X'])
+        cands, _ = pipe.stage1.detect(r['X'], _bad(r))
         hit += any(abs(t - r['mk']) <= tol for _, t in cands)
     return hit / n if n else float('nan')
 
@@ -40,7 +47,7 @@ def consolidation_recall(pipe, recs):
         if not r['epi']:
             continue
         n += 1
-        hit += any(abs(e['time'] - r['mk']) <= tol for e in pipe._events(r['X'])[0])
+        hit += any(abs(e['time'] - r['mk']) <= tol for e in pipe._events(r['X'], _bad(r))[0])
     return hit / n if n else float('nan')
 
 
@@ -54,7 +61,7 @@ def labelled_events(pipe, recs):
     tol = _tol(pipe.cfg)
     E, W, Y, G = [], [], [], []
     for i, r in enumerate(recs):
-        events, wins = pipe._event_windows(r['X'])
+        events, wins = pipe._event_windows(r['X'], _bad(r))
         for e, w in zip(events, wins):
             E.append(e); W.append(w)
             Y.append(int(bool(r['epi']) and abs(e['time'] - r['mk']) <= tol))
@@ -233,7 +240,7 @@ def centring_offsets(pipe, recs):
     for r in recs:
         if not r['epi']:
             continue
-        events, stat = pipe._events(r['X'])
+        events, stat = pipe._events(r['X'], _bad(r))
         Xs = _smooth(r['X'], cfg)
         for e in events:
             if abs(e['time'] - r['mk']) > tol:

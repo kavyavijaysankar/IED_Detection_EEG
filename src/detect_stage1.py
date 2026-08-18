@@ -7,19 +7,21 @@ threshold-diagnostic notebooks so the detector is defined once.
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
 
-SG_WIN, SG_POLY = 21, 3   # 42 ms window @ 500 Hz, cubic; near spike width, preserves peaks
+def sharpness(x, cfg):
+    """Per-channel MAD-normalised |SG 2nd derivative| (channel-adaptive sharpness units).
 
-
-def sharpness(x, sf=500.0):
-    """Per-channel MAD-normalised |SG 2nd derivative| (channel-adaptive sharpness units)."""
-    d2 = savgol_filter(x, SG_WIN, SG_POLY, deriv=2, delta=1.0 / sf)
+    The smoothing window comes from cfg.sg_samples() (42 ms, forced odd). It used to be a module-level
+    SG_WIN = 21 samples here while detection._smooth read cfg.sg_win — two sources of truth for one window,
+    invisible at 500 Hz because both were 21, and a silent half-fix waiting for any change of sample rate.
+    """
+    d2 = savgol_filter(x, cfg.sg_samples(), cfg.sg_poly, deriv=2, delta=1.0 / cfg.sfreq)
     s = np.abs(d2)
     return s / (np.median(np.abs(s - np.median(s))) + 1e-12)
 
 
-def channel_stat(X, sf=500.0):
+def channel_stat(X, cfg):
     """(n_ch, T) sharpness array for a multichannel recording X (n_ch, T)."""
-    return np.stack([sharpness(X[c], sf) for c in range(X.shape[0])])
+    return np.stack([sharpness(X[c], cfg) for c in range(X.shape[0])])
 
 
 def candidates(stat, thresh, distance):
@@ -38,15 +40,25 @@ def n_channels_crossing(stat, thresh, t0, tol):
 
 
 def _demo():
-    sf = 500.0
+    from dataclasses import replace
+    from detect_config import Config
+
+    cfg = Config()
     rng = np.random.default_rng(0)
     x = rng.normal(0, 1, 2000) * 0.02
     x += 8 * np.exp(-0.5 * ((np.arange(2000) - 1000) / 5.0) ** 2)   # sharp bump (~20 ms) at sample 1000
-    s = sharpness(x, sf)
+    s = sharpness(x, cfg)
     assert abs(int(np.argmax(s)) - 1000) <= 10, "sharpness should peak at the spike"
-    st = channel_stat(x[None, :], sf)
+    st = channel_stat(x[None, :], cfg)
     assert any(abs(p - 1000) <= 10 for _, p in candidates(st, thresh=6, distance=75)), "spike not detected"
     assert n_channels_crossing(st, 6, 1000, 50) == 1, "crossing count wrong"
+
+    # the SG window must mean the same DURATION at any rate, and must stay odd for savgol_filter
+    # rate-explicit, so this does not break when the DEFAULT sfreq changes (it has, twice)
+    assert replace(cfg, sfreq=500.0).sg_samples() == 21, "42 ms @ 500 Hz should be 21 samples"
+    assert replace(cfg, sfreq=250.0).sg_samples() == 11, "42 ms @ 250 Hz should round up to 11 (odd)"
+    for sf in (200.0, 250.0, 256.0, 500.0, 512.0, 1000.0):
+        assert replace(cfg, sfreq=sf).sg_samples() % 2 == 1, f"SG window even at {sf} Hz"
     print("detect_stage1 demo OK")
 
 

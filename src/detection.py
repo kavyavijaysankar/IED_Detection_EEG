@@ -17,7 +17,7 @@ import numpy as np
 from scipy.signal import savgol_filter
 from skfda import FDataGrid
 from skfda.preprocessing.smoothing import BasisSmoother
-from skfda.preprocessing.registration import FisherRaoElasticRegistration
+from skfda.preprocessing.registration import FisherRaoElasticRegistration, LeastSquaresShiftRegistration
 from skfda.preprocessing.dim_reduction import FPCA
 from skfda.representation.basis import BSplineBasis
 from sklearn.preprocessing import StandardScaler
@@ -30,7 +30,7 @@ from detect_stage1 import channel_stat, candidates
 
 def _smooth(X, cfg):
     """SG-smoothed signal (deriv=0) for morphology correlation and peak-to-peak."""
-    return savgol_filter(X, cfg.sg_win, cfg.sg_poly, axis=-1)
+    return savgol_filter(X, cfg.sg_samples(), cfg.sg_poly, axis=-1)
 
 
 def _norm_lag_corr(a, b, max_lag):
@@ -59,10 +59,20 @@ class Stage1:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def detect(self, X):
-        """X (n_ch, T) -> (candidates [(ch, sample)], sharpness stat (n_ch, T))."""
-        stat = channel_stat(X, self.cfg.sfreq)
+    def detect(self, X, bad=()):
+        """X (n_ch, T) -> (candidates [(ch, sample)], sharpness stat (n_ch, T)).
+
+        `bad` = interpolated channel indices, which are dropped here. That is the single enforcement point
+        for "a reconstructed channel is not evidence": with no candidates it can never join an event, so it
+        cannot satisfy min_channels (L2's only hard filter) and cannot inflate a channel count or any L4
+        spatial feature. An interpolated channel is a smooth blend of its neighbours and would otherwise
+        correlate with them by construction, manufacturing exactly the agreement L2 looks for.
+        """
+        stat = channel_stat(X, self.cfg)
         cands = candidates(stat, self.cfg.l1_threshold, self.cfg.samp(self.cfg.nms_ms))
+        if len(bad):
+            drop = set(bad)
+            cands = [(c, t) for c, t in cands if c not in drop]
         return cands, stat
 
 
@@ -196,7 +206,7 @@ def event_centre(X, event, cfg, Xs=None, stat=None):
     rc = cfg.samp(cfg.corr_halfwin_ms)
     lo, hi = max(0, event['time'] - rc), min(X.shape[1], event['time'] + rc)
     if cfg.centre_on == 'sharpness':
-        s = stat if stat is not None else channel_stat(X, cfg.sfreq)
+        s = stat if stat is not None else channel_stat(X, cfg)
         return lo + int(np.argmax(s[ch, lo:hi]))
     if cfg.centre_on != 'amplitude':
         raise ValueError(f"unknown centre_on: {cfg.centre_on}")
@@ -234,12 +244,53 @@ class Classifier:
         tg = np.linspace(t[0], t[-1], self.cfg.n_reg_points)
         return FDataGrid(sm(tg).squeeze(-1), tg)
 
+    def _polarity(self, windows):
+        """Sign of each window's central deflection: -1 downward, +1 upward.
+
+        Computed from the window itself, so nothing upstream has to pass it in. L1 (|SG 2nd derivative|)
+        and L2 (|correlation|) are deliberately polarity-blind, and error-analysis Phase 2 measured that
+        L3 is not using sign either: IEDs are ~75% downward while L3's top-scoring false positives are
+        40%, i.e. a coin flip. With 64 positives and 24 components the LR may not have the data to isolate
+        a direction encoding sign, so it is handed the cue directly.
+
+        Scale-free (a sign, not a size), so cfg.normalise_amplitude cannot change it.
+        """
+        W = np.asarray(windows, float)
+        h, c = self.cfg.samp(self.cfg.polarity_ms), W.shape[1] // 2
+        return np.sign(W[:, c - h:c + h].mean(axis=1) - np.median(W, axis=1))
+
+    def _features(self, aligned, windows):
+        """FPCA scores, with the polarity column appended when cfg.polarity_feature."""
+        F = self._fpca.transform(aligned)
+        return np.c_[F, self._polarity(windows)] if self.cfg.polarity_feature else F
+
+    def _registration(self):
+        """The registration transformer for cfg.registration.
+
+        'elastic'  Fisher-Rao: nonlinear time warping. Aligns curves tightly, but it RESHAPES them, and
+                   measured on the 90-train it distorts IEDs (movement ~1.25x their own signal) far more
+                   than mimics (~0.85x) — because the template is a Karcher mean over a pool that is 98.5%
+                   negatives, i.e. a mimic shape. FPCA is then fitted on those distorted curves, so the
+                   deformation lands in the representation the LR learns from.
+        'shift'    rigid time shift only. Cannot reshape a curve, so that asymmetry cannot arise, and it is
+                   well matched to the residual centring error (which is a pure shift). What it cannot
+                   absorb is variable spacing between the spike and its after-going slow wave.
+
+        Note for any comparison: shift registration leaves more phase variation in the curves, so FPCA may
+        need a different n_components to carry the same information. Compare across k, never at a fixed k.
+        """
+        if self.cfg.registration == 'shift':
+            return LeastSquaresShiftRegistration()
+        if self.cfg.registration != 'elastic':
+            raise ValueError(f"unknown registration: {self.cfg.registration}")
+        return FisherRaoElasticRegistration(penalty=self.cfg.penalty)
+
     def fit(self, windows, y):
         fds = self._resample(windows)
-        self._reg = FisherRaoElasticRegistration(penalty=self.cfg.penalty).fit(fds)
+        self._reg = self._registration().fit(fds)
         aligned = self._reg.transform(fds)
         self._fpca = FPCA(n_components=self.cfg.n_components).fit(aligned)
-        F = self._fpca.transform(aligned)
+        F = self._features(aligned, windows)
         self._scaler = StandardScaler().fit(F)
         Z = self._scaler.transform(F)
         self._lr = self._fit_lr(Z, y)
@@ -271,7 +322,7 @@ class Classifier:
 
     def predict_proba(self, windows):
         aligned = self._reg.transform(self._resample(windows))
-        F = self._fpca.transform(aligned)
+        F = self._features(aligned, windows)
         return self._lr.predict_proba(self._scaler.transform(F))[:, 1]
 
     def aligned_curves(self, windows):
@@ -298,20 +349,40 @@ class DetectionPipeline:
         self.consolidator = Consolidator(self.cfg)
         self.classifier = Classifier(self.cfg)
 
-    def _events(self, X):
-        """(consolidated events, L1 sharpness stat) — the stat is reused for 'sharpness' centring."""
-        cands, stat = self.stage1.detect(X)
+    def _events(self, X, bad=()):
+        """(consolidated events, L1 sharpness stat) — the stat is reused for 'sharpness' centring.
+
+        `bad` = interpolated channels, excluded from candidate generation (see Stage1.detect).
+        """
+        cands, stat = self.stage1.detect(X, bad)
         return self.consolidator.consolidate(X, cands, stat), stat
 
-    def _event_windows(self, X):
-        """Events with a valid 2 s window, paired with those windows (drops edge events)."""
+    @staticmethod
+    def background(X):
+        """Recording background amplitude: median over channels of each channel's MAD.
+
+        Robust — a 50 ms discharge among thousands of samples cannot move a median — so this measures the
+        ongoing EEG, not the events sitting on it.
+        """
+        return max(float(np.median(np.median(np.abs(X - np.median(X, axis=1, keepdims=True)), axis=1))),
+                   1e-9)
+
+    def _event_windows(self, X, bad=()):
+        """Events with a valid 2 s window, paired with those windows (drops edge events).
+
+        With cfg.normalise_amplitude, windows are divided by the recording's background amplitude, so L3
+        sees *relative prominence* — how far a transient stands out from its own background — instead of
+        absolute microvolts. L1 is already MAD-normalised and therefore scale-blind; L3 was not, which made
+        its scores track recording loudness and made one global FROC threshold unfair across recordings.
+        """
         Xs = _smooth(X, self.cfg)
-        events, stat = self._events(X)
+        events, stat = self._events(X, bad)
+        scale = self.background(X) if self.cfg.normalise_amplitude else 1.0
         kept, wins = [], []
         for e in events:
             w = event_window(X, e, self.cfg, Xs, stat)
             if w is not None:
-                kept.append(e); wins.append(w)
+                kept.append(e); wins.append(w / scale)
         return kept, wins
 
     def fit(self, recs):
@@ -319,7 +390,7 @@ class DetectionPipeline:
         tol = self.cfg.samp(self.cfg.hit_tol_ms)
         W, Y = [], []
         for r in recs:
-            events, wins = self._event_windows(r['X'])
+            events, wins = self._event_windows(r['X'], r.get('bad_hard', ()))
             for e, w in zip(events, wins):
                 W.append(w)
                 Y.append(int(bool(r['epi']) and abs(e['time'] - r['mk']) <= tol))
@@ -328,9 +399,13 @@ class DetectionPipeline:
         self.train_stats_ = {'windows': len(Y), 'positives': int(Y.sum())}
         return self
 
-    def predict(self, X):
-        """X (19, T) -> list of event dicts with an added 'score' (IED probability)."""
-        events, wins = self._event_windows(X)
+    def predict(self, X, bad=()):
+        """X (19, T) -> list of event dicts with an added 'score' (IED probability).
+
+        `bad` = interpolated channel indices from the loader, so external runs get the same treatment as
+        training (detect_data.load_recording_path returns them alongside X).
+        """
+        events, wins = self._event_windows(X, bad)
         if not wins:
             return []
         for e, s in zip(events, self.classifier.predict_proba(np.array(wins))):
@@ -381,6 +456,60 @@ def _demo():
     assert yk.sum() == 1 and len(yk) == 3, f"mining kept {len(yk)} rows, expected 1 pos + 2 neg"
     assert sorted(Zk[yk == 0].ravel()) == [0.8, 0.9], "mining should keep the hardest negatives"
     print("hard-negative mining demo OK")
+
+    # an interpolated channel must contribute NO candidates, so it can never satisfy min_channels or
+    # inflate a channel count — the single enforcement point for "reconstructed data is not evidence"
+    c_all, _ = Stage1(cfg).detect(X)
+    c_excl, _ = Stage1(cfg).detect(X, bad=[0])
+    assert any(c == 0 for c, _ in c_all), "demo signal should give channel 0 candidates to exclude"
+    assert not any(c == 0 for c, _ in c_excl), "excluded channel still produced candidates"
+    assert [k for k in c_excl] == [k for k in c_all if k[0] != 0], "exclusion changed other channels"
+    ev_excl = Consolidator(cfg).consolidate(X, c_excl, stat)
+    assert not ev_excl, "with ch0 excluded the 2-channel IED must drop below min_channels"
+    print("interpolated-channel exclusion demo OK")
+
+    # polarity feature: sign of the central deflection, and it must not depend on scale
+    g = np.exp(-0.5 * ((np.arange(1000) - 500) / 5.0) ** 2)
+    pc = Classifier(replace(cfg, polarity_feature=True))
+    for k in (1.0, 7.0):
+        pol = pc._polarity(np.array([-g, 3 * g]) * k)
+        assert list(pol) == [-1.0, 1.0], f"polarity at scale {k} should be (down, up), got {pol}"
+    print("polarity-feature demo OK")
+
+    # shift registration must pull two offset copies TOGETHER without reshaping them.
+    # LeastSquaresShiftRegistration is a local (Newton) method, so the pair must overlap to begin with —
+    # offset two curves by more than their own width and it cannot see which way to move them. That is not
+    # a problem in the cascade, where event_centre has already centred every window (measured on real
+    # windows: median shift 0.9 ms, i.e. shift registration is very nearly a no-op there).
+    L = 200
+    bump = lambda c: np.exp(-0.5 * ((np.arange(L) - c) / 18.0) ** 2)
+    pair = np.array([bump(92), bump(108)])
+    sc = Classifier(replace(cfg, registration='shift', n_basis=40, n_reg_points=L))
+    fds = sc._resample(pair)
+    al = sc._registration().fit(fds).transform(fds).data_matrix.squeeze(-1)
+    raw_peaks = [int(np.argmax(c)) for c in fds.data_matrix.squeeze(-1)]
+    peaks = [int(np.argmax(c)) for c in al]
+    assert min(np.ptp(al, axis=1)) > 0.5, "shift registration flattened the bumps"
+    assert abs(peaks[0] - peaks[1]) < abs(raw_peaks[0] - raw_peaks[1]), \
+        f"shift registration should reduce the offset: {raw_peaks} -> {peaks}"
+    for mode in ('elastic', 'shift'):
+        assert Classifier(replace(cfg, registration=mode))._registration() is not None
+    try:
+        Classifier(replace(cfg, registration='nope'))._registration()
+        raise AssertionError("unknown registration should raise")
+    except ValueError:
+        pass
+    print("shift-registration demo OK")
+
+    # amplitude normalisation must make the classifier's windows invariant to recording scale
+    p = DetectionPipeline(replace(cfg, normalise_amplitude=True))
+    _, w1 = p._event_windows(X)
+    _, w2 = p._event_windows(X * 10)
+    assert w1 and len(w1) == len(w2), "scaling the recording changed the event set"
+    assert np.allclose(w1[0], w2[0], rtol=1e-6), "normalised windows should be scale-invariant"
+    raw = DetectionPipeline(replace(cfg, normalise_amplitude=False))._event_windows(X)[1][0]
+    assert not np.allclose(w1[0], raw), "normalisation should actually change the windows"
+    print("amplitude-normalisation demo OK")
 
 
 if __name__ == '__main__':
