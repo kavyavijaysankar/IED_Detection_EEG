@@ -1,20 +1,9 @@
-"""IED detection cascade (v1): candidate generation -> consolidation -> classification.
-
-One module, one class per stage, plus a `Config` dataclass holding every tunable in one place, and
-(to come) a `DetectionPipeline` that fits/predicts/saves the whole cascade. Data loading/splitting
-lives in `detect_data`; evaluation metrics in `detect_metrics`.
-
-Layers:
-  L1 Stage1        multichannel SG 2nd-derivative candidate generation      (recorded reference)
-  L2 Consolidator  cross-correlation grouping -> events, single-channel reject, representative channel
-  L3 Classifier    FDA classifier on the representative 2 s window           (to come)
-  L4 event decision + spatial features                                       (v2, not in v1)
-"""
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import joblib
 import numpy as np
 from scipy.signal import savgol_filter
+from scipy.stats import spearmanr
 from skfda import FDataGrid
 from skfda.preprocessing.smoothing import BasisSmoother
 from skfda.preprocessing.registration import FisherRaoElasticRegistration, LeastSquaresShiftRegistration
@@ -22,9 +11,10 @@ from skfda.preprocessing.dim_reduction import FPCA
 from skfda.representation.basis import BSplineBasis
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold, cross_val_predict
 
 from detect_config import Config
-from detect_data import window_around
+from detect_data import HOMOLOGOUS, window_around
 from detect_stage1 import channel_stat, candidates
 
 
@@ -36,8 +26,7 @@ def _smooth(X, cfg):
 def _norm_lag_corr(a, b, max_lag):
     """Max over lags of |normalised cross-correlation| between two equal-length windows.
 
-    Normalised -> amplitude-invariant (a diminished copy still matches); lag search -> a delayed copy
-    still matches; absolute value -> polarity-invariant (opposite side of a dipole still matches).
+    Normalised -> amplitude-invariant (a diminished copy still matches); lag search -> a delayed copy still matches; absolute value -> polarity-invariant (opposite side of a dipole still matches).
     """
     a = a - a.mean()
     b = b - b.mean()
@@ -61,12 +50,7 @@ class Stage1:
 
     def detect(self, X, bad=()):
         """X (n_ch, T) -> (candidates [(ch, sample)], sharpness stat (n_ch, T)).
-
-        `bad` = interpolated channel indices, which are dropped here. That is the single enforcement point
-        for "a reconstructed channel is not evidence": with no candidates it can never join an event, so it
-        cannot satisfy min_channels (L2's only hard filter) and cannot inflate a channel count or any L4
-        spatial feature. An interpolated channel is a smooth blend of its neighbours and would otherwise
-        correlate with them by construction, manufacturing exactly the agreement L2 looks for.
+        bad = interpolated channel indices, which are dropped here. An interpolated channel is a smooth blend of its neighbours and would otherwise correlate with them by construction, manufacturing exactly the agreement L2 looks for.
         """
         stat = channel_stat(X, self.cfg)
         cands = candidates(stat, self.cfg.l1_threshold, self.cfg.samp(self.cfg.nms_ms))
@@ -78,14 +62,7 @@ class Stage1:
 
 class Consolidator:
     """L2: group per-channel candidates of the same spike into events via cross-correlation.
-
-    Two grouping rules (cfg.grouping), both using the same normalised/lag-searched/absolute correlation:
-      'greedy'      the sharpest unused candidate seeds an event and every other member must correlate
-                    with THAT SEED. Star-shaped.
-      'components'  single-linkage: candidates are nodes, "same spike" is an edge, events are connected
-                    components, so A~B and B~C put all three together even if A and C do not match.
-    Events with < min_channels distinct channels are rejected (single-channel = artefact). Representative
-    channel = max peak-to-peak over the correlation window, under either rule.
+    Two grouping rules (cfg.grouping), both using the same normalised/lag-searched/absolute correlation: greedy & components.
     """
 
     def __init__(self, cfg):
@@ -100,12 +77,6 @@ class Consolidator:
 
     def _components(self, X, cands):
         """Single-linkage grouping: events are connected components of the 'same spike' graph.
-
-        A discharge's scalp field is a chain, not a star — across a dipole the morphology varies enough
-        that far channels match their neighbours but not the sharpest channel, so seed-relative grouping
-        splits one discharge into several events. Single-linkage does not. Candidates are swept in time
-        order and only pairs within coincidence_ms are tested; an edge is skipped when the two are already
-        connected, so this builds a spanning forest rather than the full graph.
         """
         cfg = self.cfg
         ch_half = cfg.samp(cfg.corr_halfwin_ms)
@@ -192,15 +163,6 @@ class Consolidator:
 
 def event_centre(X, event, cfg, Xs=None, stat=None):
     """Sample the classifier window is centred on: the local extremum within +/-corr_halfwin_ms.
-
-    Registration is alignment-sensitive, so this choice matters (see cfg.centre_on):
-      'amplitude'  max |deviation from the local median| of the SMOOTHED signal (Xs, if given, so a
-                   noise sample can't grab the centre). Matches the annotation convention (marker at the
-                   spike peak) and how the classification-phase training windows were cut — but a spike
-                   riding a slow wave or a baseline shift can hand the centre to the drift instead.
-      'sharpness'  max of the L1 statistic (|SG 2nd deriv| / MAD, passed in as `stat` or recomputed).
-                   Curvature peaks at the apex of a sharp transient, so drift can't win; effectively
-                   keeps the L1 candidate time, since event['time'] is already a peak of that statistic.
     """
     ch = event['channel']
     rc = cfg.samp(cfg.corr_halfwin_ms)
@@ -223,12 +185,102 @@ def event_window(X, event, cfg, Xs=None, stat=None):
     return window_around(X[event['channel']], event_centre(X, event, cfg, Xs, stat), half)
 
 
+def member_ptp(members, Xs, cfg):
+    """Peak-to-peak of each member's +/-corr_halfwin_ms smoothed window; NaN at a recording edge."""
+    half = cfg.samp(cfg.corr_halfwin_ms)
+    out = []
+    for c, t in members:
+        w = window_around(Xs[c], t, half)
+        out.append(float(np.ptp(w)) if w is not None else np.nan)
+    return np.array(out)
+
+
+def _rank_corr(a, b):
+    """Spearman correlation, 0 where it would be degenerate (<3 points, or no spread in either)."""
+    if len(a) < 3 or np.ptp(a) == 0 or np.ptp(b) == 0:
+        return 0.0
+    r = spearmanr(a, b).statistic
+    return 0.0 if np.isnan(r) else float(r)
+
+
+def member_sign(members, Xs, cfg):
+    """Sign of each member's central deflection (-1 down, +1 up); 0 at a recording edge.
+
+    Same rule as Classifier._polarity but per member channel, against the member's own +/-corr_halfwin
+    window. L2 groups on |correlation| and throws this away, so it is information the cascade discards.
+    """
+    half, h = cfg.samp(cfg.corr_halfwin_ms), cfg.samp(cfg.polarity_ms)
+    out = []
+    for c, t in members:
+        w = window_around(Xs[c], t, half)
+        if w is None:
+            out.append(0.0)
+            continue
+        mid = len(w) // 2
+        out.append(float(np.sign(w[mid - h:mid + h].mean() - np.median(w))))
+    return np.array(out)
+
+
+def spatial_features(event, Xs, cfg, pos):
+    """L4 field geometry for one event, in mm: n_channels, compactness, extent, gradient.
+
+    compactness  mean distance from the member electrodes to their centroid — is the field contiguous
+    extent       max distance between any two members — separates an adjacent pair from opposite sides
+    nn_distance  mean distance from each member to its closest other member. Size-free: a contiguous
+                 field scores about one inter-electrode spacing whether it spans 2 channels or 15.
+    gradient     rank correlation of member peak-to-peak against distance from the representative
+                 channel. A real dipolar field falls off smoothly, so this is negative; 0 when fewer
+                 than 3 channels, where a correlation is degenerate.
+    dipole       distance between the positive- and negative-member centroids, over the extent. An
+                 average reference forces both signs to appear, so what matters is whether they are
+                 spatially ORGANISED (two poles) or scattered. 0 when either sign is absent.
+    propagation  rank correlation of member time against distance from the earliest member — a field
+                 travelling outward scores positive. 0 below 3 channels or with no time spread.
+    symmetry     mean over the 8 homologous L/R pairs of 1 - |L-R|/(L+R) on member peak-to-peak, with
+                 non-members counted as 0. 1 = mirrored, 0 = one-sided or midline-only.
+    """
+    ms = member_ptp(event['members'], Xs, cfg)
+    sg = member_sign(event['members'], Xs, cfg)
+    best = {}
+    for (c, t), p, s in zip(event['members'], ms, sg):
+        if not np.isnan(p) and p > best.get(c, (-np.inf,))[0]:
+            best[c] = (p, t, s)
+    chans = sorted(best)
+    P = pos[chans]
+    amp = np.array([best[c][0] for c in chans])
+    tim = np.array([best[c][1] for c in chans], float)
+    sgn = np.array([best[c][2] for c in chans])
+
+    compact = float(np.linalg.norm(P - P.mean(0), axis=1).mean())
+    extent = float(max((np.linalg.norm(P[i] - P[j]) for i in range(len(P)) for j in range(i + 1, len(P))),
+                       default=0.0))
+    nn = float(np.mean([min(np.linalg.norm(P[i] - P[j]) for j in range(len(P)) if j != i)
+                        for i in range(len(P))])) if len(P) > 1 else 0.0
+
+    grad = _rank_corr(np.linalg.norm(P - pos[event['channel']], axis=1), amp)
+
+    origin = int(np.argmin(tim))
+    prop = _rank_corr(np.linalg.norm(P - P[origin], axis=1), tim - tim[origin])
+
+    dipole = 0.0
+    if extent > 0 and (sgn > 0).any() and (sgn < 0).any():
+        dipole = float(np.linalg.norm(P[sgn > 0].mean(0) - P[sgn < 0].mean(0)) / extent)
+
+    a19 = np.zeros(len(pos))
+    a19[chans] = amp
+    L, R = a19[[i for i, _ in HOMOLOGOUS]], a19[[j for _, j in HOMOLOGOUS]]
+    tot = L + R
+    sym = float(np.mean(1 - np.abs(L - R)[tot > 0] / tot[tot > 0])) if (tot > 0).any() else 0.0
+
+    return {'n_channels': len(chans), 'compactness': compact, 'extent': extent,
+            'nn_distance': nn, 'gradient': grad, 'dipole': dipole,
+            'propagation': prop, 'symmetry': sym}
+
+
 class Classifier:
     """L3: FDA classifier on the representative-channel 2 s window (amplitude condition).
-
     Smooth (B-spline) -> Fisher-Rao register to a template learned from TRAIN -> FPCA -> StandardScaler
-    -> LogisticRegression. Fixed hyperparameters from the classification phase (in Config). Fitted on
-    consolidated TRAIN candidates only; the registration template + FPCA basis + scaler are then frozen.
+    LogisticRegression. Fixed hyperparameters from the classification phase (in Config). Fitted on consolidated TRAIN candidates only; the registration template + FPCA basis + scaler are then frozen.
     """
 
     def __init__(self, cfg):
@@ -246,14 +298,6 @@ class Classifier:
 
     def _polarity(self, windows):
         """Sign of each window's central deflection: -1 downward, +1 upward.
-
-        Computed from the window itself, so nothing upstream has to pass it in. L1 (|SG 2nd derivative|)
-        and L2 (|correlation|) are deliberately polarity-blind, and error-analysis Phase 2 measured that
-        L3 is not using sign either: IEDs are ~75% downward while L3's top-scoring false positives are
-        40%, i.e. a coin flip. With 64 positives and 24 components the LR may not have the data to isolate
-        a direction encoding sign, so it is handed the cue directly.
-
-        Scale-free (a sign, not a size), so cfg.normalise_amplitude cannot change it.
         """
         W = np.asarray(windows, float)
         h, c = self.cfg.samp(self.cfg.polarity_ms), W.shape[1] // 2
@@ -265,20 +309,6 @@ class Classifier:
         return np.c_[F, self._polarity(windows)] if self.cfg.polarity_feature else F
 
     def _registration(self):
-        """The registration transformer for cfg.registration.
-
-        'elastic'  Fisher-Rao: nonlinear time warping. Aligns curves tightly, but it RESHAPES them, and
-                   measured on the 90-train it distorts IEDs (movement ~1.25x their own signal) far more
-                   than mimics (~0.85x) — because the template is a Karcher mean over a pool that is 98.5%
-                   negatives, i.e. a mimic shape. FPCA is then fitted on those distorted curves, so the
-                   deformation lands in the representation the LR learns from.
-        'shift'    rigid time shift only. Cannot reshape a curve, so that asymmetry cannot arise, and it is
-                   well matched to the residual centring error (which is a pure shift). What it cannot
-                   absorb is variable spacing between the spike and its after-going slow wave.
-
-        Note for any comparison: shift registration leaves more phase variation in the curves, so FPCA may
-        need a different n_components to carry the same information. Compare across k, never at a fixed k.
-        """
         if self.cfg.registration == 'shift':
             return LeastSquaresShiftRegistration()
         if self.cfg.registration != 'elastic':
@@ -304,15 +334,6 @@ class Classifier:
 
     def _mine(self, Z, y):
         """Hard-negative mining: keep every positive but only the negatives the first pass ranks highest.
-
-        Training is ~64 positives against ~4300 negatives, nearly all of them easy — the LR spends its
-        capacity separating IEDs from background that was never going to be confused with one. Refitting
-        on the hardest negatives redraws the boundary where the false positives actually are.
-
-        Only the LR's training rows change: registration and FPCA stay fitted on everything, so the
-        representation is untouched (and stays unsupervised) and mining costs one logistic fit. Scores are
-        in-sample, the standard practice — and harmless for leakage, since this all happens strictly
-        inside whichever training set was handed to `fit`.
         """
         s = self._lr.predict_proba(Z)[:, 1]
         pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
@@ -326,32 +347,21 @@ class Classifier:
         return self._lr.predict_proba(self._scaler.transform(F))[:, 1]
 
     def aligned_curves(self, windows):
-        """(smoothed, registered) curve matrices (n, n_reg_points) — the registration diagnostic.
-
-        Overlaying the registered curves shows whether the windows the LR actually sees are aligned;
-        badly centred windows warp to the template instead of stacking on the spike.
-        """
         fds = self._resample(windows)
         return fds.data_matrix.squeeze(-1), self._reg.transform(fds).data_matrix.squeeze(-1)
 
 
 class DetectionPipeline:
-    """The v1 cascade: L1 Stage1 -> L2 Consolidator -> L3 Classifier. Fit on TRAIN recordings only.
-
-    predict(X) returns the recording's events, each with an 'score' (IED probability). save/load persist
-    Config + the fitted classifier so the model runs identically on external EDFs (load them with
-    detect_data.load_recording so the preprocessing contract — 500 Hz, CH19, µV — matches).
-    """
 
     def __init__(self, cfg=None):
         self.cfg = cfg or Config()
         self.stage1 = Stage1(self.cfg)
         self.consolidator = Consolidator(self.cfg)
         self.classifier = Classifier(self.cfg)
+        self.l4 = None
 
     def _events(self, X, bad=()):
         """(consolidated events, L1 sharpness stat) — the stat is reused for 'sharpness' centring.
-
         `bad` = interpolated channels, excluded from candidate generation (see Stage1.detect).
         """
         cands, stat = self.stage1.detect(X, bad)
@@ -360,20 +370,12 @@ class DetectionPipeline:
     @staticmethod
     def background(X):
         """Recording background amplitude: median over channels of each channel's MAD.
-
-        Robust — a 50 ms discharge among thousands of samples cannot move a median — so this measures the
-        ongoing EEG, not the events sitting on it.
         """
         return max(float(np.median(np.median(np.abs(X - np.median(X, axis=1, keepdims=True)), axis=1))),
                    1e-9)
 
     def _event_windows(self, X, bad=()):
         """Events with a valid 2 s window, paired with those windows (drops edge events).
-
-        With cfg.normalise_amplitude, windows are divided by the recording's background amplitude, so L3
-        sees *relative prominence* — how far a transient stands out from its own background — instead of
-        absolute microvolts. L1 is already MAD-normalised and therefore scale-blind; L3 was not, which made
-        its scores track recording loudness and made one global FROC threshold unfair across recordings.
         """
         Xs = _smooth(X, self.cfg)
         events, stat = self._events(X, bad)
@@ -388,38 +390,71 @@ class DetectionPipeline:
     def fit(self, recs):
         """recs: list of load_dataset dicts (fid, X, mk, epi, cert, ...) — TRAIN split only."""
         tol = self.cfg.samp(self.cfg.hit_tol_ms)
-        W, Y = [], []
-        for r in recs:
+        W, Y, K, G = [], [], [], []
+        for i, r in enumerate(recs):
             events, wins = self._event_windows(r['X'], r.get('bad_hard', ()))
             for e, w in zip(events, wins):
-                W.append(w)
+                W.append(w); K.append(e['n_channels']); G.append(i)
                 Y.append(int(bool(r['epi']) and abs(e['time'] - r['mk']) <= tol))
         W, Y = np.array(W), np.array(Y)
         self.classifier.fit(W, Y)
+        self.l4 = self._fit_l4(W, Y, np.array(K, float), np.array(G)) \
+            if self.cfg.spatial_feature else None
         self.train_stats_ = {'windows': len(Y), 'positives': int(Y.sum())}
         return self
 
-    def predict(self, X, bad=()):
-        """X (19, T) -> list of event dicts with an added 'score' (IED probability).
+    def _fit_l4(self, W, Y, K, G):
+        """Event decision: LR over (L3 score, n_channels). Returns (scaler, lr).
 
-        `bad` = interpolated channel indices from the loader, so external runs get the same treatment as
-        training (detect_data.load_recording_path returns them alongside X).
+        The L3 scores it trains on are cross-validated over the already-fitted representation. In-sample
+        scores are inflated for positives, which would make L4 lean on the score and under-use the field.
+        ponytail: only the L3 LR is cross-validated, not the registration/FPCA — those are unsupervised
+        and refitting them per fold here would add ~15 min to every model fit for a second-order effect.
+        """
+        C = self.classifier
+        Z = C._scaler.transform(C._features(C._reg.transform(C._resample(W)), W))
+        lr = LogisticRegression(C=self.cfg.lr_C, max_iter=1000, class_weight='balanced')
+        s = cross_val_predict(lr, Z, Y, groups=G, cv=GroupKFold(5), method='predict_proba')[:, 1]
+        F = np.c_[s, K]
+        scaler = StandardScaler().fit(F)
+        return scaler, lr.fit(scaler.transform(F), Y)
+
+    def predict(self, X, bad=()):
+        """X (19, T) -> event dicts with 'score', 'l3_score', 'polarity' and 'prominence' added.
+
+        'score' is L4's when cfg.spatial_feature, otherwise L3's; 'l3_score' is always L3's alone.
         """
         events, wins = self._event_windows(X, bad)
         if not wins:
             return []
-        for e, s in zip(events, self.classifier.predict_proba(np.array(wins))):
-            e['score'] = float(s)
+        W = np.array(wins)
+        s3 = self.classifier.predict_proba(W)
+        s = s3
+        if self.l4 is not None:
+            scaler, lr = self.l4
+            F = np.c_[s3, [e['n_channels'] for e in events]]
+            s = lr.predict_proba(scaler.transform(F))[:, 1]
+        for e, sc, s0, p, w in zip(events, s, s3, self.classifier._polarity(W), W):
+            e['score'], e['l3_score'] = float(sc), float(s0)
+            e['polarity'], e['prominence'] = int(p), float(np.ptp(w))
         return events
 
     def save(self, path):
-        joblib.dump({'cfg': self.cfg, 'classifier': self.classifier}, path)
+        joblib.dump({'cfg': self.cfg, 'classifier': self.classifier, 'l4': self.l4}, path)
 
     @classmethod
     def load(cls, path):
+        """Load a saved pipeline, refusing one whose stored Config predates a field the class now has."""
         d = joblib.load(path)
+        missing = sorted({f.name for f in fields(Config)} - set(d['cfg'].__dict__))
+        if missing:
+            raise ValueError(
+                f"{path} was saved before Config gained {missing}, which would now silently take today's "
+                f"class defaults and change how this model preprocesses its input. Re-save the model from "
+                f"the run notebook, or check out the code it was trained with.")
         obj = cls(d['cfg'])
         obj.classifier = d['classifier']
+        obj.l4 = d.get('l4')
         return obj
 
 
@@ -457,8 +492,7 @@ def _demo():
     assert sorted(Zk[yk == 0].ravel()) == [0.8, 0.9], "mining should keep the hardest negatives"
     print("hard-negative mining demo OK")
 
-    # an interpolated channel must contribute NO candidates, so it can never satisfy min_channels or
-    # inflate a channel count — the single enforcement point for "reconstructed data is not evidence"
+    # an interpolated channel must contribute no candidates, so it can never satisfy min_channels or inflate channel count
     c_all, _ = Stage1(cfg).detect(X)
     c_excl, _ = Stage1(cfg).detect(X, bad=[0])
     assert any(c == 0 for c, _ in c_all), "demo signal should give channel 0 candidates to exclude"
@@ -476,11 +510,6 @@ def _demo():
         assert list(pol) == [-1.0, 1.0], f"polarity at scale {k} should be (down, up), got {pol}"
     print("polarity-feature demo OK")
 
-    # shift registration must pull two offset copies TOGETHER without reshaping them.
-    # LeastSquaresShiftRegistration is a local (Newton) method, so the pair must overlap to begin with —
-    # offset two curves by more than their own width and it cannot see which way to move them. That is not
-    # a problem in the cascade, where event_centre has already centred every window (measured on real
-    # windows: median shift 0.9 ms, i.e. shift registration is very nearly a no-op there).
     L = 200
     bump = lambda c: np.exp(-0.5 * ((np.arange(L) - c) / 18.0) ** 2)
     pair = np.array([bump(92), bump(108)])
@@ -510,6 +539,84 @@ def _demo():
     raw = DetectionPipeline(replace(cfg, normalise_amplitude=False))._event_windows(X)[1][0]
     assert not np.allclose(w1[0], raw), "normalisation should actually change the windows"
     print("amplitude-normalisation demo OK")
+
+    # L4 spatial features: geometry from real electrode positions, on events with a known layout
+    from detect_data import CH19_ELECTRODES, electrode_positions
+    pos = electrode_positions()
+    ix = {e: i for i, e in enumerate(CH19_ELECTRODES)}
+    Xf = np.zeros((19, 2000))
+    for e, a in {'F7': 10.0, 'T7': 8.0, 'P7': 6.0, 'O2': 9.0}.items():
+        Xf[ix[e]] += a * np.exp(-0.5 * ((np.arange(2000) - 1000) / 5.0) ** 2)
+    ev = lambda els: {'members': [(ix[e], 1000) for e in els], 'channel': ix[els[0]]}
+    near = spatial_features(ev(['F7', 'T7']), Xf, cfg, pos)
+    far = spatial_features(ev(['F7', 'O2']), Xf, cfg, pos)
+    assert near['extent'] < far['extent'], "an adjacent pair must be tighter than opposite sides of the head"
+    assert near['n_channels'] == 2 and near['gradient'] == 0.0, "gradient is undefined below 3 channels"
+    assert abs(near['compactness'] - near['extent'] / 2) < 1e-6, "at k=2 compactness is half the extent"
+    chain = spatial_features(ev(['F7', 'T7', 'P7']), Xf, cfg, pos)
+    assert chain['gradient'] < -0.9, f"amplitude falling with distance should be negative: {chain}"
+    assert abs(near['nn_distance'] - chain['nn_distance']) < 20, \
+        "nn_distance must be size-free: a tight pair and a tight chain should score alike"
+    assert far['nn_distance'] > 2 * near['nn_distance'], "a scattered pair must score far higher"
+
+    # dipole / propagation / symmetry, each against the field that should and should not trigger it
+    def field(spec, times=None):
+        """spec: {electrode: signed amplitude}; times: {electrode: sample} (default all coincident)."""
+        Z = np.zeros((19, 2000))
+        for e, a in spec.items():
+            t = (times or {}).get(e, 1000)
+            Z[ix[e]] += a * np.exp(-0.5 * ((np.arange(2000) - t) / 5.0) ** 2)
+        ev2 = {'members': [(ix[e], (times or {}).get(e, 1000)) for e in spec],
+               'channel': ix[max(spec, key=lambda e: abs(spec[e]))]}
+        return spatial_features(ev2, Z, cfg, pos)
+
+    two_pole = field({'F7': -10, 'T7': -8, 'F8': 9, 'T8': 7})
+    one_pole = field({'F7': -10, 'T7': -8, 'F8': -9, 'T8': -7})
+    assert two_pole['dipole'] > 0.5, f"two opposite poles should separate: {two_pole['dipole']:.2f}"
+    assert one_pole['dipole'] == 0.0, "a single-sign field has no dipole"
+
+    moving = field({'F7': -10, 'T7': -8, 'P7': -6},
+                   times={'F7': 1000, 'T7': 1004, 'P7': 1008})
+    still = field({'F7': -10, 'T7': -8, 'P7': -6})
+    assert moving['propagation'] > 0.9, f"a travelling field should score high: {moving}"
+    assert still['propagation'] == 0.0, "a simultaneous field has no propagation"
+
+    mirrored = field({'F7': -10, 'F8': -10})
+    onesided = field({'F7': -10, 'T7': -10})
+    assert mirrored['symmetry'] > 0.95, f"equal L/R amplitudes should be symmetric: {mirrored}"
+    assert onesided['symmetry'] < 0.05, f"a one-sided field should not be: {onesided}"
+    print("spatial-feature demo OK")
+
+    # L4 must re-score on top of L3 and keep the L3 score; with the flag off it must be a no-op
+    p4 = DetectionPipeline(replace(cfg, spatial_feature=True))
+    p4.classifier.predict_proba = lambda W: np.full(len(W), 0.5)
+    p4.classifier._polarity = lambda W: np.ones(len(W))
+    tr = np.array([[0.0, 2.0], [1.0, 19.0]])
+    ssc = StandardScaler().fit(tr)
+    p4.l4 = (ssc, LogisticRegression().fit(ssc.transform(tr), [0, 1]))
+    evs = p4.predict(X)
+    assert evs, "demo signal should still produce an event"
+    assert all(e['l3_score'] == 0.5 for e in evs), "the raw L3 score must be preserved"
+    assert all(e['score'] != 0.5 for e in evs), "L4 should have re-scored the event"
+    p3 = DetectionPipeline(replace(cfg, spatial_feature=False))
+    p3.classifier.predict_proba = lambda W: np.full(len(W), 0.5)
+    p3.classifier._polarity = lambda W: np.ones(len(W))
+    assert all(e['score'] == e['l3_score'] == 0.5 for e in p3.predict(X)), "flag off must be a no-op"
+    print("L4 event-decision demo OK")
+
+    import os, tempfile
+    path = os.path.join(tempfile.mkdtemp(), 'stale.joblib')
+    stale = replace(cfg)
+    del stale.__dict__['bandpass']
+    joblib.dump({'cfg': stale, 'classifier': None}, path)
+    try:
+        DetectionPipeline.load(path)
+        raise AssertionError("a model whose cfg predates a Config field should be refused")
+    except ValueError as ex:
+        assert 'bandpass' in str(ex), f"the error must name the missing field: {ex}"
+    joblib.dump({'cfg': cfg, 'classifier': None}, path)
+    assert DetectionPipeline.load(path).cfg == cfg, "a complete cfg must still load"
+    print("stale-model guard demo OK")
 
 
 if __name__ == '__main__':

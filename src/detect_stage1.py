@@ -1,19 +1,10 @@
 """Stage-1 IED candidate detector: Savitzky-Golay 2nd-derivative sharpness, MAD-normalised.
-
-The front end for the detection cascade: flags where a signal is sharp (high curvature), per channel.
-Not a classifier - it thresholds a signal-processing statistic. Shared by the feasibility and
-threshold-diagnostic notebooks so the detector is defined once.
 """
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
 
 def sharpness(x, cfg):
-    """Per-channel MAD-normalised |SG 2nd derivative| (channel-adaptive sharpness units).
-
-    The smoothing window comes from cfg.sg_samples() (42 ms, forced odd). It used to be a module-level
-    SG_WIN = 21 samples here while detection._smooth read cfg.sg_win — two sources of truth for one window,
-    invisible at 500 Hz because both were 21, and a silent half-fix waiting for any change of sample rate.
-    """
+    """Per-channel MAD-normalised |SG 2nd derivative| (channel-adaptive sharpness units)."""
     d2 = savgol_filter(x, cfg.sg_samples(), cfg.sg_poly, deriv=2, delta=1.0 / cfg.sfreq)
     s = np.abs(d2)
     return s / (np.median(np.abs(s - np.median(s))) + 1e-12)

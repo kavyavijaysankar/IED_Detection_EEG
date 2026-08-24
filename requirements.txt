@@ -5,3 +5,4 @@ scikit-fda==0.9.1
 mne==1.8.0
 pandas==2.3.3
 joblib==1.5.3
+multimethod==2.0.2

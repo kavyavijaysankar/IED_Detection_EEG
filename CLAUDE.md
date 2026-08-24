@@ -74,7 +74,10 @@ in-distribution (it only ever sees consolidated candidate windows).
 ## 3. Current state — what's built & tested
 
 - **`src/detect_config.py`** — `Config` dataclass: every tunable in one place (§6). Imported everywhere.
-- **`src/detect_data.py`** — `CH19` (19 common 10-20 channels), `load_recording`/`load_recording_path`/
+- **`src/detect_data.py`** — `CH19` (19 common 10-20 channels), `electrode`/`match_channels` (the
+  external-data naming trust boundary: strips reference suffix + modality prefix, exact-matches, aliases
+  the old `T3/T4/T5/T6`, and **refuses** missing / ambiguous / bipolar montages — added 2026-08-18, see
+  report.md §9 pre-flight), `load_recording`/`load_recording_path`/
   `load_dataset` — all three take **`cfg`** (not a `reference` string) since Phase 0. `load_recording_path`
   is **the single preprocessing entry point**: everything applied to the signal before L1 goes there and
   nowhere else, driven entirely by `cfg`, so a run can't preprocess differently from training. Also
@@ -105,7 +108,11 @@ in-distribution (it only ever sees consolidated candidate windows).
   All need `RUN_GROUPED_CV = True` — they reuse its out-of-fold scores. Phase 3 (spatial-feature
   separation, the L4 go/no-go) is specified in report.md §7 but not built.
 - **`predict.py`** + **`requirements.txt`** (pinned) — supervisor entrypoint:
-  `python predict.py <model.joblib> <recording.edf> [--score]`.
+  `python predict.py <model.joblib> <recording.edf> [--score]`. `--score` defaults to **0.80**, the
+  pre-registered ≤10 FP/min CV operating point (was an uncalibrated 0.5 until 2026-08-18).
+  **`requirements.txt` also pins `multimethod==2.0.2`** — without it a clean install dies at `import skfda`
+  with a metaclass conflict, because `scikit-fda==0.9.1` does not pin its own dependencies. **Verified by
+  building a fresh venv**, which is the only way that class of bug shows up. Python 3.11.
 - **`IED Detection/detection_run.ipynb`** — split → fit(90) → window-centring check (train only) → test
   report + figures → save model → **grouped CV** → three sweeps. ~5 min for the main path.
   - The grouped CV and all four sweeps are **flag-guarded** (`RUN_GROUPED_CV`, `n_components_sweep`,
@@ -237,10 +244,36 @@ frozen (report.md §7), and the supervisor's expected IEDs-per-recording for the
 
 **Coming back to later** (report.md §8): **A** window length (`classifier_halfwin_s`; the spike is ~2.5% of
 a 2 s window so registration and FPCA are dominated by background) · **B** shape-versus-size, the main
-sensitivity lever · **C** L4 spatial features, the main FP lever · **D** the Neuronostics pilot, now also
-exporting the downward fraction and bad-channel count · **E** random-crop eval · **F** report the prominence
-baseline as a second null model · **G** re-measure window centring, its stated mechanism is now doubtful · **I** decouple an event's TIME
+sensitivity lever · ~~**C** L4 spatial features~~ **DONE 2026-08-20, report.md §7** · ~~**D** the
+Neuronostics pilot~~ **DONE — `pilot.py`, validation run returned** · **E** random-crop eval · **F** report
+the prominence baseline as a second null model · ~~**G** re-measure window centring~~ **DONE 2026-08-20,
+amplitude confirmed, mechanism refuted** · **I** decouple an event's TIME
 (sharpest member) from its representative CHANNEL (max peak-to-peak) — the S26 lesson; needs its own CV.
+
+**L4 (2026-08-20): gate passed, biggest gain since `n_components`, but read the caveats.** Four arms over
+out-of-fold CV scores, combining LR fitted inside the same folds. PR-AUC 0.170 → **0.358** (arm D), @1
+FP/min 0.14 → 0.41, hits 33 → 39 (arm B), FPs 181 → 154 (arm D). ΔPR-AUC vs arm A: B +0.179
+[+0.079, +0.291], D +0.207 [+0.102, +0.324], both P(>0)=1.00. **But:** the gain is `n_channels`, not
+geometry (arm C alone is not established, +0.027 [−0.017, +0.071]); `gradient` failed its gate (0.480)
+and its dipolar-falloff hypothesis is refuted; and **the entire gain is in wide-field IEDs** — narrow
+(≤9 ch) stays 6/13 in every arm while wide goes 27/35 → 33/35. The pre-registered ≤2-channel subgroup is
+EMPTY (Kural's narrowest IED spans 4 channels), so **Kural cannot test the focal case**.
+**Nine arms tested in total (A–D, P1, P2, E, F, E+F) and B is still the best** — all in the run
+notebook's last three sections; `src/detection.py` has `spatial_features`/`member_ptp`,
+`detect_data.electrode_positions` has the montage coordinates. Nothing adopted yet.
+- **"It is just size re-entering" was pre-specified and REFUTED.** Prominence scores 0.805 against the
+  full negative pool (matching the prominence baseline's 0.801) but **0.455 — below chance — against the
+  top FPs**, where `n_channels` holds 0.703. Adding prominence to channel count *costs* PR-AUC (P2 vs B
+  −0.075) and its weight collapses to +0.06. The two correlate only +0.327. **The gain is genuinely
+  spatial.**
+- **Binning `n_channels` and a size-free contiguity measure both LOSE to plain B** (E vs B −0.123
+  [−0.219, −0.024]; F vs B −0.155 [−0.279, −0.046]). E's coefficients confirm the relationship is
+  non-monotone (`k=2 +0.22, k≥8 +0.50` vs the 3–7 reference) but collapsing 8–19 throws away where 40 of
+  60 positives live. F failed because **top FPs are contiguous too** (60.8 vs 64.6 mm) — L2's ≥0.7
+  correlation grouping already enforces contiguity, so the feature is redundant two layers downstream.
+- **Lead the L4 writeup with this: narrow-field IEDs are 6/13 in all nine arms.** Not size, not channel
+  count, not binning, not contiguity, not prominence. A well-evidenced negative, and the honest
+  counterweight to a doubled PR-AUC.
 
 ---
 
@@ -372,11 +405,10 @@ registration='elastic'; n_basis=70; penalty=0.1; n_components=24; lr_C=1.0; hard
 n_reg_points=100
 hit_tol_ms=100; n_test=10; split_seed=0
 ```
-**`detect_model.joblib` IS already polarity-fitted** — verified directly: 25 features in the scaler and LR,
-`polarity_feature=True` in its stored cfg, and `predict.py` runs on it. Its stored cfg predates the Phase 0
-renames (it holds `sg_win`, not `sg_ms`/`reference`/`registration`), which is harmless because those
-defaults reproduce the old behaviour — but the Phase 4 Restart & Run All is still owed to bring the model,
-figures and test report into one consistent state after preprocessing.
+**`detect_model.joblib` is current and shippable — re-verified 2026-08-18.** All 32 Config fields present
+(`sfreq=250`, `bandpass=(0.5,45)`, `reference='average'`, `grouping='components'`, `registration='elastic'`,
+`normalise_amplitude=True`, `polarity_feature=True`), 25 features in both scaler and LR, FPCA k=24. The
+Phase 4 Restart & Run All is done; nothing is owed here.
 **`Config.sg_samples()`, not `samp(sg_ms)`, is what the SG filter must use** — `savgol_filter` requires an
 odd window and 42 ms at 250 Hz rounds to 10.
 **`polarity_ms=20` is settled — do not sweep it again.** Pre-specified from the Phase-2 measurement, then
@@ -417,7 +449,11 @@ The `'shift'` branch is kept as a re-runnable ablation; don't delete it, and don
   not crash and the output looked entirely plausible.** (An earlier version of this note said the mismatch
   fails "loudly". It does not. That is worse.)
   - **Rule: give a new Config field the default that reproduces existing saved models, or re-save the model
-    in the same change.** Until the Phase 4 re-run, `detect_model.joblib` must not be used or shared.
+    in the same change.** ~~Until the Phase 4 re-run, `detect_model.joblib` must not be used or shared.~~
+  - **RESOLVED 2026-08-18 and now GUARDED, not just documented.** `DetectionPipeline.load` compares the
+    stored cfg's `__dict__` with the current `Config` fields and raises, naming what is missing. The
+    shipped `detect_model.joblib` was verified to hold all 32 fields (250 Hz, average, 25 features), so it
+    is safe to share. Keep the rule anyway — the guard stops a stale model, it does not fix one.
   - The polarity part of the earlier note was also wrong and is corrected: the saved model holds 25 features
     and `polarity_feature=True`, so it IS polarity-fitted.
 - **Amplitude statistics cannot measure warping — they are invariant to it by construction.** Time warping
@@ -434,6 +470,10 @@ The `'shift'` branch is kept as a re-runnable ablation; don't delete it, and don
   (~3–4 min per fit, so a grouped CV is ~13 min). Sweeps that only change what sits *downstream* of
   registration (`n_components`, `lr_C`, `hard_neg_ratio`) share one registration per fold and are then
   nearly free — use that pattern. `n_basis` is upstream and needs a full refit per value.
+  - **That is FIT. Inference is ~25× cheaper and this was measured, not assumed (2026-08-18).** `predict`
+    only calls `transform` against an already-fitted template: **21.1 min of EEG scores in 42.6 s end to
+    end** (L1 0.2 s, L2 6.3 s, L3 36.1 s, peak RSS 0.61 GB). So a 20-min clinical recording is ~45 s and
+    the whole Neuronostics pilot is ~1.2 h, not overnight. Don't quote the fit cost for a prediction run.
 - `Consolidator._greedy` is O(seeds × candidates); on a 20-minute recording that is ~tens of seconds
   (an earlier note claiming it "would not finish" was wrong). `_components` is roughly linear.
 - Build via generator scripts in the scratchpad + headless smoke tests (patch `plt.savefig`/`plt.show` to

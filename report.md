@@ -98,8 +98,14 @@ no `bandpass` or `reference` field, so on load it inherited the *new* class defa
 `'average'`. `predict.py` therefore ran a model trained on 500 Hz / unfiltered / recorded-reference data
 over 500 Hz / bandpassed / average-referenced input. **It did not error, and the detections it printed
 looked entirely plausible** — the scores were meaningless. An earlier draft of this note asserted such a
-mismatch would "fail loudly"; it does not, which makes it considerably more dangerous. **`detect_model.joblib`
-must not be used or shared until the Phase 4 re-run re-saves it.**
+mismatch would "fail loudly"; it does not, which makes it considerably more dangerous. ~~**`detect_model.joblib`
+must not be used or shared until the Phase 4 re-run re-saves it.**~~
+
+**RESOLVED 2026-08-18, twice over (§9 pre-flight).** The file was verified to carry **all 32 Config fields**,
+so the Phase-4 re-save did happen and it is safe to share. And the hazard now has a **guard rather than a
+rule**: `DetectionPipeline.load` compares the stored cfg's `__dict__` against the current `Config` fields and
+raises, naming the missing ones. The discipline note below still stands — but it is no longer the only thing
+standing between a stale model and a plausible wrong answer.
 
 ---
 
@@ -984,6 +990,118 @@ does, it is far more informative than "L3 discrimination is the bottleneck", and
 promising-looking morphology levers (centring, `n_basis`, polarity, warping) have all produced small or null
 effects. It also predicts where the remaining headroom is: the window (§8 A) and shape-versus-size (§8 B).
 
+### L4 — spatial features, Phase 3: RUN 2026-08-20, gate PASSED, but read the subgroup row
+Four arms over the out-of-fold CV scores (no L3 refitting; the combining LR is fitted inside the same
+folds). Features pre-specified before measuring; the notebook's last cell reproduces all of this.
+
+**Univariate screen** (pre-registered gate: AUC ~0.65 separating hits from FPs):
+
+| feature | vs all 4,097 negatives | vs the 181 top FPs | verdict |
+|---|---|---|---|
+| `n_channels` | **0.797** | **0.703** | passes comfortably |
+| `extent` | 0.744 | 0.636 | passes on the full pool |
+| `compactness` | 0.702 | 0.627 | passes on the full pool |
+| `gradient` | 0.480 | 0.562 | **fails — hypothesis refuted** |
+
+The amplitude-gradient hypothesis is dead, and informatively: top FPs fall off *more* steeply with
+distance (median −0.4) than real IEDs (−0.3), the opposite of the dipolar-field prediction.
+
+**The four arms** (grouped 5-fold, 90-train, 49 IEDs / 60 positives / 4,157 windows):
+
+| arm | ROC | PR-AUC | @1 | @5 | @10 | @25 | hits | miss | FPs | narrow | wide |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| L3 raw (reference) | 0.865 | 0.170 | 0.14 | 0.51 | 0.67 | 0.82 | 33 | 16 | 181 | 6/13 | 27/35 |
+| **A** score only | 0.861 | 0.151 | 0.08 | 0.49 | 0.67 | 0.80 | 33 | 16 | 186 | 6/13 | 27/35 |
+| **B** + `n_channels` | 0.875 | **0.331** | **0.41** | 0.71 | **0.80** | 0.86 | **39** | **10** | 183 | 6/13 | 33/35 |
+| **C** geometry only | 0.838 | 0.178 | 0.22 | 0.49 | 0.65 | 0.84 | 32 | 17 | **175** | 6/13 | 26/35 |
+| **D** everything | 0.852 | **0.358** | 0.37 | **0.73** | 0.78 | 0.86 | 38 | 11 | **154** | 5/13 | 33/35 |
+
+ΔPR-AUC vs arm A, recording-level paired bootstrap: **B +0.179 [+0.079, +0.291] P(>0)=1.00**;
+**D +0.207 [+0.102, +0.324] P(>0)=1.00**; **C +0.027 [−0.017, +0.071] P=0.92 — not established.**
+
+**This is the largest effect since `n_components`.** PR-AUC roughly doubles against raw L3 (0.170 →
+0.358), sensitivity at ≤1 FP/min goes 0.14 → 0.41, and arm D gains 5 IEDs *while* cutting false
+positives 181 → 154. Three caveats have to travel with it:
+
+- **It is channel count, not field geometry.** Arm C — the bias-free arm with the good transfer story —
+  is not established. Strip `n_channels` out and the gain nearly vanishes. The type-agnostic contiguity
+  argument did not survive the data.
+- **The entire gain is in wide-field IEDs.** Narrow-field (bottom quartile, ≤9 channels): **6/13 in every
+  arm**, and D drops to 5/13. Wide-field: 27/35 → 33/35. The detector improved where it was already
+  strongest. The pre-registered ≤2-channel subgroup came back **EMPTY** — Kural's narrowest IED spans 4
+  channels — so the quartile split is a post-hoc substitute and must be labelled as one. **Kural cannot
+  test the focal case**, which is exactly the case that matters clinically.
+- ~~**`n_channels` is a size measure and we removed size deliberately.** Its univariate ROC of 0.797 is
+  indistinguishable from the prominence baseline's 0.801; both measure event magnitude.~~
+  **PRE-SPECIFIED AND REFUTED the same day — see the prominence arms below.** The two AUCs really are
+  that close, but they are not the same quantity and they do not behave alike where it matters.
+
+Two reading notes. **Arm A is worse than raw L3** (PR 0.151 vs 0.170) because per-fold recalibration
+reorders events across folds — so every Δ against A flatters the arm, and the honest comparison is
+against 0.170. And **arm D's geometry coefficients are collinear** (`compactness` +0.73, `extent` −1.12,
+with signs flipped from arm C) and must not be interpreted.
+
+#### Prominence arms — the "size re-entering" hypothesis, tested and REFUTED
+Pre-specified: if prominence reproduces what `n_channels` does, L4 is not a spatial result at all but
+§8 **B** (shape versus size) by the side door. It does not.
+
+| arm | ROC | PR-AUC | @1 | @5 | hits | miss | FPs | narrow | wide |
+|---|---|---|---|---|---|---|---|---|---|
+| **A** score only | 0.861 | 0.151 | 0.08 | 0.49 | 33 | 16 | 186 | 6/13 | 27/35 |
+| **B** + `n_channels` | 0.875 | **0.331** | **0.41** | 0.71 | **39** | **10** | 183 | 6/13 | 33/35 |
+| **P1** + prominence | 0.860 | 0.135 | 0.02 | 0.47 | 31 | 18 | 176 | 5/13 | 26/35 |
+| **P2** + both | 0.873 | 0.255 | 0.29 | 0.71 | 38 | 11 | **136** | 5/13 | 33/35 |
+
+ΔPR-AUC: **P1 vs A −0.016 [−0.058, +0.007]** (prominence alone slightly *hurts*); **P2 vs B −0.075
+[−0.170, +0.013]** (adding it to channel count *costs*); **P2 vs P1 +0.120 [+0.064, +0.226]** (channel
+count adds a great deal on top of it). In P2 the prominence weight collapses to **+0.06** against
+`n_channels`' +0.49.
+
+**The decisive number is the univariate split**: prominence scores **0.805 against the full negative pool
+— reproducing the prominence baseline's documented 0.801 — but 0.455, below chance, against the 181 top
+false positives.** `n_channels` holds **0.703** there. Prominence separates IEDs from easy background,
+which L3 already does, and carries nothing where the decision is actually made. Rank correlation between
+the two features is only +0.327 (+0.477 among positives).
+
+**So the L4 gain is genuinely spatial.** `n_channels` measures how widely the discharge is distributed
+across the scalp, and that is information neither L3 nor any magnitude measure holds.
+
+#### Arms E and F — binning and a size-free field measure. Both LOSE to B.
+**E** = `n_channels` binned `{2} / {3–7} / {≥8}` (edges chosen anatomically, not from the enrichment
+table, which comes from the same 60 positives). **F** = mean nearest-neighbour distance between member
+electrodes — size-free by construction: a contiguous field measures ~60 mm whether it spans 2, 3 or 5
+channels, against 185 mm for a scattered pair.
+
+| arm | ROC | PR-AUC | @1 | @5 | @10 | hits | miss | FPs | narrow | wide |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **B** + `n_channels` | 0.875 | **0.331** | **0.41** | **0.71** | **0.80** | **39** | **10** | 183 | 6/13 | 33/35 |
+| **E** + binned k | 0.864 | 0.207 | 0.20 | 0.59 | 0.73 | 36 | 13 | 172 | 6/13 | 30/35 |
+| **F** + `nn_distance` | 0.853 | 0.176 | 0.14 | 0.51 | 0.67 | 33 | 16 | **161** | 6/13 | 27/35 |
+| **E+F** | 0.859 | 0.211 | 0.20 | 0.59 | 0.73 | 36 | 13 | 175 | 6/13 | 30/35 |
+
+**E vs B −0.123 [−0.219, −0.024]**, **F vs B −0.155 [−0.279, −0.046]**, **E+F vs B −0.120
+[−0.223, −0.018]** — all significantly worse. **F vs A +0.024 [+0.010, +0.057]** is a small but
+established gain over baseline, and F gives the lowest FP count of any arm (161).
+
+- **Why F failed, and it is the useful part.** Median `nn_distance` is **60.8 mm for IEDs and 64.6 mm
+  for top FPs** — the false positives are contiguous too (69 vs 76 mm even among 2-channel events). The
+  scattered-pair case the feature was built to catch barely exists, because **L2 already enforces
+  contiguity**: an event only forms if its members correlate at ≥0.7 within 50 ms. F is largely redundant
+  with a filter two layers upstream — which also explains arm C.
+- **E confirmed the hypothesis and still lost.** Coefficients came out `k=2 +0.22, k≥8 +0.50` against the
+  `3–7` reference, so the relationship really is **non-monotone** and 2-channel events do deserve a
+  positive weight. But collapsing 8–19 into one bin discards the gradient where 40 of the 60 positives
+  live, and that costs more than the low end gains.
+
+#### What survives
+**B is the best arm.** Seven arms have now been compared on the same 49 IEDs (A–D, P1, P2, E, F, E+F), so
+whatever is adopted is a choice made on the 90-train CV and must be reported with the losing arms shown.
+
+**And the finding that should probably lead the L4 writeup: narrow-field IEDs are 6/13 in every single
+arm.** Not size, not channel count, not binning, not contiguity, not prominence. Whatever limits those 13
+discharges is none of the quantities measured here — a well-evidenced negative rather than a suspicion,
+and the honest counterweight to a doubled PR-AUC.
+
 ### Evaluation issues still open
 - **Random cropping not yet implemented.** The marker is centred in ~99% of clips, which inflates the
   centre baseline. Varying the marker position at eval (min 2.33 s before / 5.08 s after) is needed
@@ -1321,9 +1439,12 @@ only the first disjunct was true. The two numbers:
   low-prominence discharges and L3 cannot promote "small but well-formed". Candidate: normalise each window
   by its own peak-to-peak so only shape remains. Measure, don't assume — absolute prominence is real
   evidence of a discharge.
-- **C. L4 / spatial features — the main remaining lever on false positives.** Go/no-go is the Phase 3
+- ~~**C. L4 / spatial features — the main remaining lever on false positives.** Go/no-go is the Phase 3
   error-analysis test: if no spatial feature reaches univariate AUC ~0.65 separating hits from FPs, report
-  L4 as tested-and-rejected. Now also has the bad-channel flag available.
+  L4 as tested-and-rejected.~~ **DONE 2026-08-20 — gate passed, see §7.** Largest gain since
+  `n_components` (PR-AUC 0.170 → 0.358, @1 FP/min 0.14 → 0.41), but it comes from `n_channels`, not
+  geometry, and lands entirely on wide-field IEDs. Open follow-ups: prominence as a fifth feature, and
+  whether to adopt B or D.
 - **D. Neuronostics pilot script** (§9). Now with **two extra transfer diagnostics** to export: the
   downward fraction per recording (ours 51% of events, ~75% of the top) and the bad-channel count.
 - **E. Random-crop evaluation**, so the centre baseline is a fair bar.
@@ -1332,6 +1453,14 @@ only the first disjunct was true. The two numbers:
 - **G. Re-measure the window-centring comparison** — its stated mechanism is now doubtful (§6) and the
   original measurement predates both the `n_components` fix and normalisation.
 - **H. Optional, low value:** extend k to 64; one confirmatory greedy-vs-components run at the tuned k.
+- **J. Which signal do the amplitude measures read? (raised 2026-08-20, unresolved.)** Three different
+  representations of the same waveform are in use at once: `gradient` takes member peak-to-peak from the
+  **SG-smoothed** signal (matching how L2 picks its representative channel), `prominence` takes it from
+  the **unsmoothed** window (`event_window` cuts from `X`; `Xs` only locates the centre), and L3 alone
+  sees the **B-spline fit** (`n_basis=70`, inside `Classifier._resample`, representative channel only).
+  The geometry features — `compactness`, `extent`, `nn_distance` — read no signal at all, only which
+  electrodes are members. Decide whether that mix is deliberate, and whether the L4 measures should come
+  off the spline fit instead.
 - **I. Decouple an event's TIME from its representative CHANNEL** (raised by the S26 diagnosis, Phase 1).
   Both currently come from the max-peak-to-peak member, but they answer different questions: the time feeds
   hit/miss and localisation, while the channel selects the window L3 classifies. On a slow-wave-dominated
@@ -1362,6 +1491,78 @@ its evidence, and it is mutually exclusive with fixing the template.
 
 ## 9. Neuronostics pilot script (designed, not yet built)
 
+### Pre-flight verification — RUN 2026-08-18, before writing the pilot script
+Everything the shipped artefact depends on, checked end to end rather than assumed. Three fixes and two
+findings, one of which was a genuine shipping blocker.
+
+**The saved model is sound and shippable.** `detect_model.joblib` holds **all 32 Config fields** (so the
+Phase-4 re-save really happened and the §1 "must not be used or shared" caveat is discharged),
+`sfreq=250.0`, `reference='average'`, `registration='elastic'`, and **25 features** in both the scaler and
+the LR — i.e. 24 FPCA components plus the polarity column, as intended.
+
+**BLOCKER FOUND AND FIXED — a clean install from `requirements.txt` did not work.** Built a fresh venv on
+Python 3.11 from the pinned file and `import skfda` died at once:
+`TypeError: metaclass conflict` from `multimethod`. Cause: **`scikit-fda==0.9.1` does not pin its own
+dependencies**, and the current `multimethod` release (2.1) is incompatible with it; the dev `.venv` merely
+happened to hold 2.0.2 from months ago. Fixed by pinning **`multimethod==2.0.2`** in `requirements.txt`.
+Re-verified: a clean venv now loads the model and reproduces detection scores **identical to the dev
+environment**. This is exactly the "most likely way this dies at step 1" that this section predicted, it
+was real, and it would have been the supervisor's first five minutes.
+
+**RUNTIME — MEASURED, and the report's estimate was 25× too pessimistic.** All 100 Kural recordings
+concatenated into one **21.1-minute** array (19 × 315,750) and run through the loaded model:
+
+| stage | count | time | per min of EEG |
+|---|---|---|---|
+| L1 candidates | 39,834 | 0.2 s | 0.0 s |
+| L2 events | 5,593 | 6.3 s | 0.3 s |
+| L3 scoring | 5,593 windows | 36.1 s | 1.7 s |
+| **total** | | **42.6 s** | peak RSS **0.61 GB** |
+
+- **Why the old estimate was wrong, and it is worth knowing:** the "3–4 min" figure is the cost of
+  *fitting* the Fisher-Rao registration (an iterative Karcher mean over thousands of curves). `predict`
+  only ever calls `transform` against an already-fitted template, which is a different order of magnitude.
+  **Fit is slow; transform is cheap.** The §8 gotcha "the L3 registration dominates everything" is true of
+  training and CV, and false of inference.
+- **Consequences:** a 20-minute recording is ~45 s, so 40 recordings ≈ 30 min and 100 ≈ **1.2 h**. The
+  5-per-group validation run is minutes. Memory is a non-issue.
+- **It also revives a parked idea.** §9's multi-view scoring was rejected partly on cost ("3–5× runtime,
+  30 h for 100 recordings"). At the measured rate 3–5× is ~3.5 min per recording, ~6 h for 100 —
+  inconvenient, not prohibitive. The cost objection no longer carries the argument; judge it on merit.
+- Event rate on the concatenation was **266/min against Kural's ~217/min**, inflated by the 99 artificial
+  discontinuities at the joins. **Use ~217/min as the transfer-diagnostic baseline**, not 266.
+
+**FIX 1 — channel-name matching, the external-data trust boundary (`detect_data.electrode` /
+`match_channels`).** `raw.pick(CH19)` demanded literally `E FP1-Ref`; any clinical EDF (`EEG Fp1-REF`,
+`Fp1-A1`, bare `Fp1`) raised on the supervisor's first file. Now the reference suffix and modality prefix
+are stripped and the residue is matched **exactly** — never by substring, so an extended array's `FC3` or
+`TP7` cannot masquerade as `C3` or `P7`. **The old 10-20 nomenclature is aliased** (`T3/T4/T5/T6` →
+`T7/T8/P7/P8`), which is common enough in clinical files that without it a perfectly good recording fails
+as "missing 4 electrodes". Three conditions **refuse** rather than degrade, since none has an honest
+partial answer, and each error names what the file actually contains:
+- a **missing** electrode;
+- an **ambiguous** one (the same electrode present twice, possibly under different references);
+- a **bipolar montage** (`F7-T3`, `C3-Cz`), detected by testing whether what follows the dash is itself one
+  of our electrodes. Worth its own check: a bipolar file would otherwise match on each name's first
+  component and be scored as if referential, producing plausible-looking meaningless numbers — the one
+  failure mode that cannot be caught by reading the output.
+- **Verified end to end**, not just by unit test: a Kural test recording was copied and its EDF header
+  labels rewritten to `EEG Fp1-REF` / `EEG T3-REF` style, and `predict.py` returned **bit-identical
+  detections and scores** on both files. Kural's own names still map (asserted), so nothing upstream moved.
+
+**FIX 2 — `DetectionPipeline.load` now refuses a model whose stored Config predates a field the class has.**
+The §1 hazard (a missing field silently taking today's class default) had documentation but no guard, and
+it had already bitten once without erroring. Three lines, checked at load, with the missing field names in
+the message. Self-checked in `detection.__main__` by saving a cfg with `bandpass` deleted.
+
+**FIX 3 — `predict.py --score` default 0.5 → 0.80**, the pre-registered ≤10 FP/min operating point from the
+grouped CV (33/49 hits, 181 FPs). 0.5 was a placeholder that had never been calibrated against anything.
+
+**Sanity check on real data:** `predict.py` on held-out **S46** (`clear_positive`, marker 6.6621 s) fires at
+**6.66 s with score 0.996** — a 2 ms localisation error — plus 3 other events above 0.80. All three module
+self-checks pass.
+
+
 **Task as set by the supervisor:** two groups of recordings — *confirmatory* (contain IEDs, count unknown,
 not localised) and *non-confirmatory* (no IEDs). Run L1→L2→L3 on each, output numbers only (we never see
 the recordings). If the groups separate, a neurologist knows which EEG to review. **Not a localisation
@@ -1370,8 +1571,10 @@ task** — no FROC, no localisation error, since there are no markers.
 - **It is `predict.py` in a loop.** That script already loads the model, loads an arbitrary EDF over CH19
   and runs all three layers. The delta is: walk two folders, write CSV instead of printing. One new file,
   ~40 lines. Nothing else in the repo changes.
-- **Recordings are 15–20 min** (vs 11–14 s for Kural) → ~5,000 candidate events each, ~3–4 min per
-  recording. 40 recordings ≈ 2 h; 100 ≈ overnight.
+- **Recordings are 15–20 min** (vs 11–14 s for Kural). ~~~5,000 candidate events each, ~3–4 min per
+  recording. 40 recordings ≈ 2 h; 100 ≈ overnight.~~ **MEASURED 2026-08-18 and the estimate was 25× too
+  pessimistic — see "Pre-flight verification" below. A 20-minute recording takes ~45 s, so 100 recordings
+  is ~1.2 h, not overnight.**
   - **`grouping='components'` is strongly preferred on runtime, but is not a hard blocker** (an earlier
     note in this report claimed greedy "would not finish" — that was wrong). Greedy's inner loop runs over
     every candidate for each *seed*, so it is O(seeds x candidates): at ~34,000 candidates and ~10,000
@@ -1389,7 +1592,8 @@ task** — no FROC, no localisation error, since there are no markers.
   - The member list is the L4 hook: spatial features (field spread, focal vs bilateral, which electrodes)
     can be computed here from the returned CSV, so **L4 can be developed later and applied retrospectively
     without him re-running anything**. Only per-channel L3 *scores* are unrecoverable, and scoring every
-    member channel would multiply runtime 3–5× (30 h for 100 recordings) — rejected for a pilot.
+    member channel would multiply runtime 3–5× — ~~30 h for 100 recordings~~ **~6 h at the measured rate
+    (see pre-flight above); still rejected for a pilot, but on simplicity now, not on cost.**
 ### Pilot pre-test — RUN, and the premise holds
 Recording-level separation on the 90-train from out-of-fold CV scores, 49 epileptic vs 41 non-epileptic:
 
