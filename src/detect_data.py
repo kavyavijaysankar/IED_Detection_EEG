@@ -127,8 +127,10 @@ def load_dataset(manifest, edf_dir, cfg=None):
 
 def stratified_split(manifest, n_test=10, seed=0):
     """Recording-level train/test split, stratified on certainty.
-    Returns (train_df, test_df).
+    Returns (train_df, test_df); n_test=0 puts everything in train and returns an empty test frame.
     """
+    if n_test == 0:
+        return manifest.reset_index(drop=True), manifest.iloc[0:0].reset_index(drop=True)
     train, test = train_test_split(manifest, test_size=n_test, random_state=seed,
                                    stratify=manifest['certainty'])
     return train.reset_index(drop=True), test.reset_index(drop=True)
@@ -153,6 +155,8 @@ def _selfcheck():
     assert not (set(tr['file_id']) & set(te['file_id'])), "train/test overlap"
     tr2, te2 = stratified_split(man, n_test=10, seed=0)
     assert list(te['file_id']) == list(te2['file_id']), "split not deterministic"
+    tr0, te0 = stratified_split(man, n_test=0, seed=0)
+    assert len(tr0) == len(man) and len(te0) == 0, "n_test=0 should train on everything"
 
     assert electrode('E FP1-Ref') == electrode('EEG Fp1-REF') == electrode('Fp1-A1') == 'FP1'
     assert electrode('EEG T3-LE') == 'T7' and electrode('T6') == 'P8', "old 10-20 names must alias"

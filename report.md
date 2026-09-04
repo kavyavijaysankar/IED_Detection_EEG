@@ -45,7 +45,8 @@ Terminology matches the code. Last updated: 2026-08-18.
   `localisation_errors` and `bootstrap_auc_ci` then work off *any* score vector, so the same code serves
   the test set and the out-of-fold CV scores. Plus `layer1_recall`, `consolidation_recall`,
   `classifier_auc`, `grouped_cv`, `froc`, `froc_summary`, `threshold_at`, `detection_counts`,
-  `centre_baseline`, `centring_offsets`, `report`. Module constant `FP_BUDGET = 10` fixes the operating
+  `centre_baseline`, `centring_offsets`, `report`. **`cfg.fp_budget` (moved out of the module constant
+  `FP_BUDGET` on 2026-08-26) fixes the operating
   point hits/misses/FPs are reported at.
 - **`detect_plots.py`** — evaluation figures, one function per panel, each drawing into an `ax` passed in:
   `froc`, `roc`, `pr`, `counts`, `score_hist`, `fold_aucs`, `timeline`, `loc_error`, `event_panel`. Shared by the
@@ -759,7 +760,7 @@ model saw).
   only: it asks whether a random IED outranks a random non-IED, and ~98.5% of the non-IEDs are easy
   background the model gets credit for beating. PR-AUC and the FROC cannot be gamed that way.
 - **Operating point: hits / misses / false positives** (`M.detection_counts`) at the threshold from
-  `M.threshold_at(points, M.FP_BUDGET)` (`FP_BUDGET = 10` FP/min).
+  `M.threshold_at(points, cfg.fp_budget)` (10 FP/min).
   - **hit** = an IED with ≥1 above-threshold event within ±hit_tol of its marker; **miss** = an IED with
     none; **fp** = every other above-threshold event.
   - **Correct rejections are deliberately never reported**, and neither is anything derived from them
@@ -1093,9 +1094,123 @@ established gain over baseline, and F gives the lowest FP count of any arm (161)
   positive weight. But collapsing 8–19 into one bin discards the gradient where 40 of the 60 positives
   live, and that costs more than the low end gains.
 
-#### What survives
-**B is the best arm.** Seven arms have now been compared on the same 49 IEDs (A–D, P1, P2, E, F, E+F), so
-whatever is adopted is a choice made on the 90-train CV and must be reported with the losing arms shown.
+#### Arm B — ADOPTED and wired (2026-08-20), with its error analysis
+`cfg.spatial_feature=True`; `DetectionPipeline._fit_l4` fits an LR over (L3 score, `n_channels`) and
+`predict` applies it, keeping the raw L3 value as `l3_score`. The L3 scores it trains on are
+cross-validated over the already-fitted representation — in-sample scores are inflated for the 60
+positives and would make L4 lean on the score and under-use the field. Operating point moves 0.80 → 0.775.
+
+| | L3 | arm B |
+|---|---|---|
+| clear / unclear found | 65% / 69% | **80% / 79%** |
+| median extra FPs to reach a miss | +567 | +818 |
+| FPs, worst-9 share | 181, 35% | 183, 32% |
+| epileptic vs non-epileptic FP rate | 10.7 / 8.1 min⁻¹ | 11.1 / 7.8 min⁻¹ |
+
+- **+6 IEDs, −0 lost.** S09, S27, S86, S44, S19, S47 — **every one spans 17–19 channels.**
+- **The certainty inversion is gone** (L3 found *fewer* clear than unclear); both classes rose 10–15 pts.
+- **`n_channels` is spent.** Median channels: L3's FPs 6, B's FPs **11**, removed by B 3, newly introduced
+  by B **14**, the IEDs themselves **14**. The survivors are now indistinguishable from IEDs on this axis.
+- **Substantial churn**: 119 kept, 62 removed, 64 new — a re-ranking, not a refinement.
+- **The narrow-field harm is real but sub-threshold.** Of the 7 narrow IEDs still missed, three scored
+  *lower* under B: S08 0.714→0.678, S82 0.431→0.370, S36 0.439→0.290. S42 misses by 0.016 (0.759 vs
+  0.775). Nothing crossed from hit to miss on Kural; on a cohort with more focal IEDs it might.
+
+#### Dipole, propagation, symmetry — and the nonlinearity arms
+Three further features (`src/detection.py:spatial_features`), then the scale and interaction questions.
+Univariate, and the fraction of events for which each is undefined (zero):
+
+| feature | vs all neg | vs top FPs | zero | verdict |
+|---|---|---|---|---|
+| `dipole` | 0.520 | 0.518 | 29% | no marginal signal, **real conditional signal** |
+| `propagation` | 0.481 | 0.433 | 40% | **null — predicted in advance** |
+| `symmetry` | 0.772 | 0.720 | 63% | strong alone, **collinear with `n_channels`** |
+
+| arm | ROC | PR | @1 | hits | FPs | narrow |
+|---|---|---|---|---|---|---|
+| **B** score+k | 0.875 | 0.331 | 0.41 | 39 | 183 | 6/13 |
+| **B+D** +dipole | 0.869 | **0.363** | **0.49** | **40** | 172 | **7/13** |
+| B+Di +`dipole>0` | 0.862 | 0.343 | 0.45 | 38 | 183 | 5/13 |
+| Bl logit+k | **0.877** | 0.251 | 0.29 | 38 | **119** | 5/13 |
+| B+D+k2 | 0.872 | **0.376** | 0.45 | 39 | 188 | 6/13 |
+| B+D+int | 0.860 | 0.361 | 0.45 | 39 | 155 | 6/13 |
+
+ΔPR-AUC: **B+D vs B +0.0327 [+0.0000, +0.0614] P=0.97**; B+D vs B+Di +0.0208 P=0.86; Bl vs B −0.0797
+P=0.05; B+D+k2 vs B+D +0.0125 P=0.86; B+D+int vs B+D −0.0022 P=0.41. Earlier, on the same base:
+propagation −0.0035 P=0.32, symmetry +0.0124 P=0.65.
+
+- **`propagation` is refuted, exactly as predicted.** `coincidence_ms=50` caps an event's time spread at
+  12 samples at 250 Hz; there is no dynamic range to carry a gradient. A clean pre-registered negative.
+- **`symmetry` is `n_channels` in disguise.** 63% zeros, and adding it collapses the `n_channels` weight
+  +0.50 → +0.34 while it takes +0.31. It re-measures bilateral spread.
+- **`dipole` survives its control.** Replacing the value with the binary `dipole>0` collapses the weight
+  to **+0.02** (against the value's +0.29) and is worse on every axis. The magnitude carries the
+  information, not the definedness.
+- **`logit(score)` LOSES, and instructively.** Best ROC (0.877) and by far the fewest FPs (119), but the
+  worst PR-AUC and @1. It stretches the easy-negative mass over ~14 units of range and spends the linear
+  capacity there; the raw probability's saturation near zero is useful *because* 98.5% of the pool is
+  trivial negatives.
+- **`k=2` rejected despite the best PR-AUC.** It improves the metric it is scored on while dropping @1
+  (0.49→0.45), a hit, 16 more FPs, and the narrow subgroup (7/13→6/13) — the very thing it was built for.
+  **Third instance of the headline metric disagreeing with the FROC's left end**, this time PR-AUC.
+
+#### Phase / warping as a feature — TESTED and REJECTED (2026-08-26)
+Elastic FDA splits variation into **amplitude** (the registered curve, which FPCA sees) and **phase** (the
+warping function `gamma`, which is applied at predict time and then **discarded**). §6's measurement that
+elastic warping moves IEDs ~1.25× their own signal but mimics ~0.85× implied phase carries class
+information, so it was screened. `skfda`'s `FisherRaoElasticRegistration` exposes the warpings as
+`reg.warping_` after `transform` — an instance attribute, not on the class, so it does not show in `dir`.
+
+Three summaries of `gamma` over the 90-train pool (4,157 windows), against out-of-fold scores:
+
+| quantity | vs all neg | vs top FPs | IED median | top-FP median |
+|---|---|---|---|---|
+| `magnitude` — mean \|γ(t) − t\| | 0.529 | 0.567 | 0.0558 | 0.0473 |
+| `roughness` — sd of γ′ | 0.403 | 0.538 | 0.3313 | 0.3248 |
+| `peak_shift` | 0.559 | 0.558 | 0.1010 | 0.0606 |
+
+| arm | ROC | PR | @1 | hits | FPs |
+|---|---|---|---|---|---|
+| B score+k | 0.875 | 0.331 | **0.41** | **39** | 183 |
+| B+Wm +magnitude | 0.874 | 0.350 | 0.37 | 39 | 177 |
+| B+W +all three | 0.875 | **0.372** | 0.41 | **37** | **149** |
+
+ΔPR-AUC vs B: **+0.0195 [−0.0038, +0.0365] P=0.93** (magnitude) and **+0.0414 [−0.0374, +0.1036] P=0.83**
+(all three). Neither established, and both trade sensitivity for precision — the all-three arm **loses 2
+IEDs** to buy 34 fewer false positives. `dipole` dominates them: it improves PR-AUC, @1, hits, FPs *and*
+the narrow subgroup simultaneously.
+
+- **A correction to how §6's 1.25×/0.85× should be read.** As a raw displacement ratio the classes barely
+  differ: IED/negative median warping magnitude is **1.061**. That figure was warping relative to each
+  curve's *own* signal, a different normalisation, and it must not be quoted as "warping magnitude
+  separates IEDs from mimics" — measured directly, it does not.
+- `magnitude` correlates −0.045 with the L3 score, so it *is* orthogonal — but orthogonal and
+  uninformative.
+- Consistent with the convergent finding: if registration's benefit comes from aligning the ~97.5% of the
+  window that is not the spike, then how much warping a window needs is mostly a property of its
+  background, not of the discharge.
+- **Fourth instance of PR-AUC rising while the FROC's left end or the hit count falls** (after
+  `n_components`, `k=2`, and `logit`). The rule holds: lead with the FROC.
+- Not exhaustive: three scalar summaries were tested, not `gamma` itself. A full phase representation
+  (FPCA on the SRSF of the warping functions) could in principle carry more, but at 60 positives and with
+  every summary sitting near 0.5, that is a low-probability, high-cost follow-up.
+
+#### What survives — B+D ADOPTED 2026-08-26
+**B+D is the best arm** (PR 0.363, @1 0.49, 40 hits, 172 FPs, narrow 7/13) and is now **wired**:
+`_fit_l4` and `predict` both build their row through `DetectionPipeline._l4_row`
+= (L3 score, `n_channels`, `dipole`), so training and inference cannot diverge. Operating point
+**0.775 → 0.784**; `predict.py` and `pilot.py` updated. The run notebook's CV cell now refits L4 inside
+the same folds and reports the FROC, AUC and PR-AUC of **the shipped scores**, not L3's — `cv['scores']`
+stays L3-only for the arm cells, with the pipeline scores in `cv['l4']`.
+Localisation under B+D: **10 ms over the 40 detected**, 12 ms over all 48 IEDs with a near-marker event.
+Roughly twenty arms have
+now been compared on the same 49 IEDs, so anything adopted is a choice made on the 90-train CV and must
+be reported with the losing arms shown.
+
+**The narrow-field IEDs remain the standing failure**, moving only 6/13 → 7/13 across every arm. Their L3
+scores are 0.18–0.76, so **L4 cannot reach them** — reweighting cannot rescue what L3 ranked near the
+bottom. That is §8 **B** (shape versus size), an L3 problem. And with n=13 no plausible fix is
+statistically distinguishable here, so the honest position is that **Kural cannot settle the focal case**.
 
 **And the finding that should probably lead the L4 writeup: narrow-field IEDs are 6/13 in every single
 arm.** Not size, not channel count, not binning, not contiguity, not prominence. Whatever limits those 13
@@ -1114,7 +1229,15 @@ and the honest counterweight to a doubled PR-AUC.
 - **The FROC is computed on 5 IEDs**, so sensitivity moves in steps of 0.2. Proposed fix: compute a
   **cross-validated FROC** on the 90 (fit per fold, predict on held-out recordings, pool out-of-fold
   scores) for a curve over 49 IEDs instead of 5.
-- **Considered and rejected — dissolving the test split to gain 10 training recordings.** The per-fold
+- **REVERSED 2026-08-26 by the user: `cfg.n_test = 0`, all 100 recordings train, 54 IEDs.** The holdout
+  held 5 IEDs, moved in steps of 0.2, was never trusted for a decision, and by its own admission was no
+  longer selection-free (read several times, config chosen against CV numbers). The grouped CV over all
+  100 is now the single performance estimate, and it gains 5 IEDs (49 → 54), which tightens it.
+  `stratified_split(n_test=0)` returns an empty test frame; the notebook's test cells are guarded.
+  **The cost, which must be declared in the writeup:** ~20 L4 arms and several L3 hyperparameters were
+  selected on this CV, and there is no longer any held-out estimate to check that optimism against. The
+  one corroboration that existed (test 0.874 against CV 0.865) stands as a historical record only.
+- ~~**Considered and rejected — dissolving the test split to gain 10 training recordings.**~~ The per-fold
   AUC spread (0.57–0.83) matches the Hanley-McNeil standard error for ~10 positives per fold almost
   exactly, so it is *measurement noise*, not evidence of a data-starved model; +5 IEDs would not change
   it. The holdout matters more, not less, now that hyperparameters are being tuned on the 90.

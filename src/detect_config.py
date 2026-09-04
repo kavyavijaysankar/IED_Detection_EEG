@@ -53,7 +53,7 @@ class Config:
     
     registration: str = 'elastic' # 'elastic' (Fisher-Rao nonlinear warping) or 'shift' (rigid time shift)
 
-    spatial_feature: bool = True # L4: re-score events with an LR over (L3 score, n_channels)
+    spatial_feature: bool = True # L4: re-score events with an LR over (L3 score, n_channels, dipole)
 
     n_basis: int = 70
 
@@ -70,8 +70,10 @@ class Config:
     # --- evaluation ---
     hit_tol_ms: float = 100.0
 
+    fp_budget: float = 10.0 # FP/min the operating point is quoted at.
+
     # --- split (recording-level, in detect_data) ---
-    n_test: int = 10
+    n_test: int = 0 # 0 = train on all 100; the 10-recording holdout held only 5 IEDs
     split_seed: int = 0
 
     def samp(self, ms):

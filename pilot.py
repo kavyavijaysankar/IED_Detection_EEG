@@ -11,17 +11,17 @@ import numpy as np
 warnings.filterwarnings('ignore', message='Invalid measurement date')
 
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
-from detect_data import CH19_ELECTRODES, load_recording_path, match_channels, window_around
-from detection import DetectionPipeline, _smooth
+from detect_data import CH19_ELECTRODES, electrode_positions, load_recording_path, match_channels
+from detection import DetectionPipeline, _smooth, member_sign, member_ptp, spatial_features
 
-THRESHOLD = 0.775   # pre-registered <=10 FP/min operating point from our grouped CV
+THRESHOLD = 0.766   # pre-registered <=10 FP/min operating point from grouped CV
 
 REC_COLS = ['file', 'folder', 'duration_s', 'input_sfreq', 'channels_matched', 'error',
             'n_candidates', 'n_events', 'n_above_thr', 'threshold',
             'q90', 'q95', 'q99', 'n_above_0.5', 'n_above_0.7', 'n_above_0.9',
             'background_uv', 'p99_abs_uv', 'bad_soft', 'bad_hard', 'over_cap', 'mad_ratio']
 EVENT_COLS = ['file', 'folder', 'time_s', 'channel', 'members', 'n_channels', 'score', 'l3_score',
-              'polarity', 'prominence', 'l1_sharpness']
+              'dipole', 'polarity', 'prominence', 'l1_sharpness']
 
 
 def header(path):
@@ -68,20 +68,21 @@ def scan(pipe, path, folder, threshold):
     cands, stat = pipe.stage1.detect(X, bads['hard'])
     events = pipe.predict(X, bads['hard'])
 
-    Xs = _smooth(X, pipe.cfg)
-    ch_half = pipe.cfg.samp(pipe.cfg.corr_halfwin_ms)
+    Xs, pos = _smooth(X, pipe.cfg), electrode_positions()
     rows = []
     for e in events:
-        members = []
-        for c, t in sorted(e['members'], key=lambda m: m[1]):
-            w = window_around(Xs[c], t, ch_half)
-            ptp = float(np.ptp(w)) if w is not None else float('nan')
-            members.append(f"{CH19_ELECTRODES[c]}@{t / pipe.cfg.sfreq:.3f}:{ptp:.1f}")
+        # electrode@time:peak-to-peak:sign per member. The sign is what makes the field's dipole
+        # structure recoverable offline — L2 groups on |correlation| and would otherwise discard it.
+        ms = sorted(zip(e['members'], member_ptp(e['members'], Xs, pipe.cfg),
+                        member_sign(e['members'], Xs, pipe.cfg)), key=lambda m: m[0][1])
+        members = [f"{CH19_ELECTRODES[c]}@{t / pipe.cfg.sfreq:.3f}:{p:.1f}:{s:+.0f}"
+                   for (c, t), p, s in ms]
         rows.append({'file': path.name, 'folder': folder,
                      'time_s': round(e['time'] / pipe.cfg.sfreq, 4),
                      'channel': CH19_ELECTRODES[e['channel']], 'members': ';'.join(members),
                      'n_channels': e['n_channels'], 'score': round(e['score'], 6),
                      'l3_score': round(e['l3_score'], 6),
+                     'dipole': round(spatial_features(e, Xs, pipe.cfg, pos)['dipole'], 4),
                      'polarity': e['polarity'], 'prominence': round(e['prominence'], 4),
                      'l1_sharpness': round(float(stat[e['channel'], e['time']]), 4)})
 
@@ -117,13 +118,20 @@ def ask_folder():
         print(f"  not a folder: {p}")
 
 
-def run(pipe, files, threshold, out):
+def run(pipe, files, threshold, out, resume=False):
     out.mkdir(parents=True, exist_ok=True)
+    rec_p, ev_p = out / 'pilot_recordings.csv', out / 'pilot_events.csv'
+    done = set()
+    if resume and rec_p.exists():
+        done = {(r['folder'], r['file']) for r in csv.DictReader(open(rec_p))}
+        files = [(p, f) for p, f in files if (f, p.name) not in done]
+        print(f"resuming: {len(done)} recordings already written, {len(files)} to go\n")
+    mode = 'a' if done else 'w'
     t0, n_fail = time.time(), 0
-    with open(out / 'pilot_recordings.csv', 'w', newline='') as rf, \
-            open(out / 'pilot_events.csv', 'w', newline='') as ef:
+    with open(rec_p, mode, newline='') as rf, open(ev_p, mode, newline='') as ef:
         rw, ew = csv.DictWriter(rf, REC_COLS), csv.DictWriter(ef, EVENT_COLS)
-        rw.writeheader(); ew.writeheader()
+        if mode == 'w':
+            rw.writeheader(); ew.writeheader()
         for path, folder in files:
             try:
                 rec, rows = scan(pipe, path, folder, threshold)
@@ -136,8 +144,7 @@ def run(pipe, files, threshold, out):
             ew.writerows(rows)
             rf.flush(); ef.flush()
     print(f"\ndone in {(time.time() - t0) / 60:.1f} min, {n_fail} failed. Wrote:"
-          f"\n  {(out / 'pilot_recordings.csv').resolve()}"
-          f"\n  {(out / 'pilot_events.csv').resolve()}")
+          f"\n  {rec_p.resolve()}\n  {ev_p.resolve()}")
 
 
 def selfcheck(model):
@@ -158,7 +165,10 @@ def selfcheck(model):
     assert [f for _, f in files] == ['a', 'a', 'b', 'b'], f"recursion/folder labels wrong: {files}"
     run(DetectionPipeline.load(model), files, thr, tmp)
 
+    n_before = len(list(csv.DictReader(open(tmp / 'pilot_recordings.csv'))))
+    run(DetectionPipeline.load(model), files, thr, tmp, resume=True)   # must be a no-op
     recs = list(csv.DictReader(open(tmp / 'pilot_recordings.csv')))
+    assert len(recs) == n_before, f'resume duplicated rows: {n_before} -> {len(recs)}'
     evs = list(csv.DictReader(open(tmp / 'pilot_events.csv')))
     assert [r['file'] for r in recs] == [p.name for p, _ in files], "one row per file, in order"
     bad = [r for r in recs if r['error']]
@@ -176,11 +186,12 @@ def selfcheck(model):
         assert e['folder'] in ('a', 'b'), f"bad folder label {e['folder']}"
         assert e['channel'] in CH19_ELECTRODES, f"bad electrode label {e['channel']}"
         assert e['polarity'] in ('-1', '1', '0'), f"bad polarity {e['polarity']}"
+        assert -1.0 <= float(e['dipole']) <= 1.0, f"dipole out of range: {e['dipole']}"
         parts = e['members'].split(';')
         assert len(parts) >= int(e['n_channels']), "members must cover at least n_channels"
         for m in parts:
             el, _, rest = m.partition('@')
-            assert el in CH19_ELECTRODES and ':' in rest, f"malformed member {m}"
+            assert el in CH19_ELECTRODES and len(rest.split(':')) == 3, f"malformed member {m}"
     shutil.rmtree(tmp)
     print(f"\npilot selfcheck OK  |  {len(good)} scanned, 1 error row, {len(evs)} events")
 
@@ -193,6 +204,8 @@ def main():
     ap.add_argument('--threshold', type=float, default=THRESHOLD, help=f'score threshold ({THRESHOLD})')
     ap.add_argument('--out', help='output folder (default: results beside this script)')
     ap.add_argument('--check', action='store_true', help='validate headers/montage only, then stop')
+    ap.add_argument('--resume', action='store_true',
+                    help='continue an interrupted run, skipping recordings already in the CSV')
     ap.add_argument('--selfcheck', action='store_true', help='end-to-end test on the Kural recordings')
     args = ap.parse_args()
 
@@ -213,7 +226,7 @@ def main():
     if args.check:
         return
     print(f"\n{len(files)} recordings, threshold {args.threshold}\n")
-    run(pipe, files, args.threshold, Path(args.out) if args.out else here / 'results')
+    run(pipe, files, args.threshold, Path(args.out) if args.out else here / 'results', args.resume)
     if prompted:
         try:
             input("\nPress Enter to close.")

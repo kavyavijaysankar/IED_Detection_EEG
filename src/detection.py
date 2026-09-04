@@ -14,7 +14,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold, cross_val_predict
 
 from detect_config import Config
-from detect_data import HOMOLOGOUS, window_around
+from detect_data import HOMOLOGOUS, electrode_positions, window_around
 from detect_stage1 import channel_stat, candidates
 
 
@@ -390,21 +390,28 @@ class DetectionPipeline:
     def fit(self, recs):
         """recs: list of load_dataset dicts (fid, X, mk, epi, cert, ...) — TRAIN split only."""
         tol = self.cfg.samp(self.cfg.hit_tol_ms)
-        W, Y, K, G = [], [], [], []
+        pos = electrode_positions()
+        W, Y, S, G = [], [], [], []
         for i, r in enumerate(recs):
             events, wins = self._event_windows(r['X'], r.get('bad_hard', ()))
+            Xs = _smooth(r['X'], self.cfg)
             for e, w in zip(events, wins):
-                W.append(w); K.append(e['n_channels']); G.append(i)
+                W.append(w); S.append(self._l4_row(e, Xs, pos)); G.append(i)
                 Y.append(int(bool(r['epi']) and abs(e['time'] - r['mk']) <= tol))
         W, Y = np.array(W), np.array(Y)
         self.classifier.fit(W, Y)
-        self.l4 = self._fit_l4(W, Y, np.array(K, float), np.array(G)) \
+        self.l4 = self._fit_l4(W, Y, np.array(S, float), np.array(G)) \
             if self.cfg.spatial_feature else None
         self.train_stats_ = {'windows': len(Y), 'positives': int(Y.sum())}
         return self
 
-    def _fit_l4(self, W, Y, K, G):
-        """Event decision: LR over (L3 score, n_channels). Returns (scaler, lr).
+    def _l4_row(self, event, Xs, pos):
+        """The L4 spatial inputs for one event: (n_channels, dipole)."""
+        f = spatial_features(event, Xs, self.cfg, pos)
+        return [f['n_channels'], f['dipole']]
+
+    def _fit_l4(self, W, Y, S, G):
+        """Event decision: LR over (L3 score, n_channels, dipole). Returns (scaler, lr).
 
         The L3 scores it trains on are cross-validated over the already-fitted representation. In-sample
         scores are inflated for positives, which would make L4 lean on the score and under-use the field.
@@ -415,7 +422,7 @@ class DetectionPipeline:
         Z = C._scaler.transform(C._features(C._reg.transform(C._resample(W)), W))
         lr = LogisticRegression(C=self.cfg.lr_C, max_iter=1000, class_weight='balanced')
         s = cross_val_predict(lr, Z, Y, groups=G, cv=GroupKFold(5), method='predict_proba')[:, 1]
-        F = np.c_[s, K]
+        F = np.c_[s, S]
         scaler = StandardScaler().fit(F)
         return scaler, lr.fit(scaler.transform(F), Y)
 
@@ -432,7 +439,8 @@ class DetectionPipeline:
         s = s3
         if self.l4 is not None:
             scaler, lr = self.l4
-            F = np.c_[s3, [e['n_channels'] for e in events]]
+            Xs, pos = _smooth(X, self.cfg), electrode_positions()
+            F = np.c_[s3, [self._l4_row(e, Xs, pos) for e in events]]
             s = lr.predict_proba(scaler.transform(F))[:, 1]
         for e, sc, s0, p, w in zip(events, s, s3, self.classifier._polarity(W), W):
             e['score'], e['l3_score'] = float(sc), float(s0)
@@ -591,7 +599,7 @@ def _demo():
     p4 = DetectionPipeline(replace(cfg, spatial_feature=True))
     p4.classifier.predict_proba = lambda W: np.full(len(W), 0.5)
     p4.classifier._polarity = lambda W: np.ones(len(W))
-    tr = np.array([[0.0, 2.0], [1.0, 19.0]])
+    tr = np.array([[0.0, 2.0, 0.0], [1.0, 19.0, 0.9]])   # (L3 score, n_channels, dipole)
     ssc = StandardScaler().fit(tr)
     p4.l4 = (ssc, LogisticRegression().fit(ssc.transform(tr), [0, 1]))
     evs = p4.predict(X)

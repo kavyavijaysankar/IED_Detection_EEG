@@ -14,8 +14,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('model', help='saved pipeline, e.g. detect_model.joblib')
     ap.add_argument('edf', help='EDF recording to scan')
-    ap.add_argument('--score', type=float, default=0.775,
-                    help='min IED score to report (default 0.775, the pre-registered <=10 FP/min point)')
+    ap.add_argument('--score', type=float, default=0.766,
+                    help='min IED score to report (default 0.766, the pre-registered <=10 FP/min point)')
     args = ap.parse_args()
 
     pipe = DetectionPipeline.load(args.model)

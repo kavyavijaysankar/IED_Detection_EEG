@@ -14,7 +14,6 @@ from sklearn.model_selection import GroupKFold
 from detection import Classifier, event_centre, event_window, _smooth
 
 
-FP_BUDGET = 10.0    # FP/min operating point the confusion matrix is reported at (see threshold_at)
 
 
 def _tol(cfg):
@@ -277,8 +276,8 @@ def report(pipe, recs):
     print("  FROC — best sensitivity at FP/min budget:")
     for fp, sens in froc_summary(pts).items():
         print(f"    <= {fp:>3} FP/min : sens {sens:.2f}")
-    c = detection_counts(recs, E, G, scores, cfg, threshold_at(pts, FP_BUDGET))
-    print(f"  operating point @ <= {FP_BUDGET:.0f} FP/min (score >= {c['threshold']:.2f}):")
+    c = detection_counts(recs, E, G, scores, cfg, threshold_at(pts, cfg.fp_budget))
+    print(f"  operating point @ <= {cfg.fp_budget:.0f} FP/min (score >= {c['threshold']:.3f}):")
     print(f"    hits {c['hit']}/{c['hit'] + c['miss']}   misses {c['miss']}   "
           f"false positives {c['fp']} ({c['fp_per_min']:.1f}/min)")
     return E, scores, Y, G

@@ -95,7 +95,10 @@ in-distribution (it only ever sees consolidated candidate windows).
   built on; `froc_points`, `localisation_errors`, `detection_counts` and `bootstrap_auc_ci` then work off
   **any** score vector, so the same code serves the test set and out-of-fold CV scores. Plus
   `layer1_recall`, `consolidation_recall`, `classifier_auc`, `grouped_cv`, `froc`, `froc_summary`,
-  `threshold_at`, `centre_baseline`, `centring_offsets`, `report`. `FP_BUDGET = 10` sets the operating
+  `threshold_at`, `centre_baseline`, `centring_offsets`, `report`. **`cfg.fp_budget` (was the module
+  constant `FP_BUDGET`) is an EXTERNAL criterion** — clinical review burden, or comparability with
+  published detectors at 0.5–5 FP/min — **never picked by which threshold reads best**; the threshold is
+  then derived from it by `threshold_at`. Quote several budgets, name one primary. It sets the operating
   point hits/misses/FPs are quoted at.
 - **`src/detect_plots.py`** — one function per figure panel, each drawing into an `ax`: `froc`, `roc`, `pr`,
   `counts`, `score_hist`, `fold_aucs`, `timeline`, `loc_error`, `event_panel` (single-event waveform for
@@ -258,9 +261,43 @@ geometry (arm C alone is not established, +0.027 [−0.017, +0.071]); `gradient`
 and its dipolar-falloff hypothesis is refuted; and **the entire gain is in wide-field IEDs** — narrow
 (≤9 ch) stays 6/13 in every arm while wide goes 27/35 → 33/35. The pre-registered ≤2-channel subgroup is
 EMPTY (Kural's narrowest IED spans 4 channels), so **Kural cannot test the focal case**.
-**Nine arms tested in total (A–D, P1, P2, E, F, E+F) and B is still the best** — all in the run
-notebook's last three sections; `src/detection.py` has `spatial_features`/`member_ptp`,
-`detect_data.electrode_positions` has the montage coordinates. Nothing adopted yet.
+**~20 arms tested; B+D is ADOPTED and wired (2026-08-26).**
+- **Live**: `cfg.spatial_feature=True`, `DetectionPipeline._fit_l4` = LR over **(L3 score, `n_channels`,
+  `dipole`)**, both `fit` and `predict` building the row through `_l4_row` so they cannot diverge;
+  `predict` keeps `l3_score`. **Operating point 0.80 → 0.775 (B) → 0.784 (B+D)** — `predict.py` and
+  `pilot.py` updated. **The model the supervisor holds is two generations behind** (L3-only, threshold
+  0.80), so his returned pilot CSVs carry L3 scores at 0.80.
+- **The run notebook's CV cell now evaluates the SHIPPED pipeline**: it refits L4 inside the same folds
+  and reports FROC/AUC/PR-AUC from those scores (`s_final`, also in `cv['l4']`). `cv['scores']` remains
+  L3-only so the trailing arm cells keep their correct baseline. Quoting `cv['auc']` now means L3.
+  `_fit_l4` trains
+  on L3 scores cross-validated over the fitted representation (in-sample scores are inflated and would
+  make L4 under-use the field); only the L3 LR is cross-validated, not registration/FPCA.
+- **Arm B error analysis: +6 IEDs, −0 lost**, all spanning 17–19 channels; the certainty inversion
+  disappears (65%/69% → 80%/79%); miss cost rises +567 → +818 (the residue is harder). **`n_channels` is
+  spent** — B's surviving FPs have median 11 channels against the IEDs' 14, and its *newly introduced*
+  FPs median 14, i.e. indistinguishable. Narrow-field harm is real but sub-threshold (3 of the 7 misses
+  scored lower; S42 misses by 0.016).
+- **`dipole` is the adopted addition** (B+D: PR 0.363, @1 0.49, 40 hits, 172 FPs, narrow **7/13**;
+  ΔPR +0.0327 [+0.0000, +0.0614] P=0.97). It survives its control — the binary `dipole>0` collapses to a
+  +0.02 weight against the value's +0.29 — and is orthogonal to size. Localisation 10 ms over the 40
+  detected. Caveat to keep: P=0.97 with the CI touching zero, after ~20 arms on 49 IEDs.
+- **Phase / warping REJECTED (2026-08-26).** `reg.warping_` (an instance attribute set by `transform`,
+  not visible on the class) gives `gamma`. Three summaries — magnitude, roughness, peak shift — score
+  0.53 / 0.40 / 0.56 against the full pool and 0.57 / 0.54 / 0.56 against the top FPs. As arms: +0.0195
+  [−0.0038, +0.0365] P=0.93 (magnitude), +0.0414 [−0.0374, +0.1036] P=0.83 (all three) — neither
+  established, and the all-three arm **loses 2 IEDs** for 34 fewer FPs. **Correction to §6: the
+  1.25×/0.85× asymmetry does NOT reproduce as a raw displacement ratio (1.061)** — that was warping
+  relative to each curve's own signal and must not be quoted as "warping separates IEDs from mimics".
+  Fourth case of PR-AUC rising while hits or @1 fall.
+- **Refuted:** `propagation` (0.481 univariate; `coincidence_ms=50` leaves 12 samples of range — predicted
+  in advance), `symmetry` (collinear: it drops `n_channels` +0.50 → +0.34), `logit(score)` (−0.080, P=0.05
+  — best ROC and fewest FPs but worst PR-AUC, because it spends linear capacity on the easy-negative
+  mass), `k=2` dummy (best PR-AUC yet **worse** @1, hits, FPs and narrow subgroup — the third case of the
+  headline metric disagreeing with the FROC's left end), `score × n_channels` (null).
+- Code: `src/detection.py` has `spatial_features`/`member_ptp`/`member_sign`/`_rank_corr`;
+  `detect_data.electrode_positions` + `HOMOLOGOUS`. The run notebook's trailing sections reproduce every
+  arm and **should be folded into the main CV cell and deleted** once adoption is finalised.
 - **"It is just size re-entering" was pre-specified and REFUTED.** Prominence scores 0.805 against the
   full negative pool (matching the prominence baseline's 0.801) but **0.455 — below chance — against the
   top FPs**, where `n_channels` holds 0.703. Adding prominence to channel count *costs* PR-AUC (P2 vs B
@@ -271,9 +308,11 @@ notebook's last three sections; `src/detection.py` has `spatial_features`/`membe
   non-monotone (`k=2 +0.22, k≥8 +0.50` vs the 3–7 reference) but collapsing 8–19 throws away where 40 of
   60 positives live. F failed because **top FPs are contiguous too** (60.8 vs 64.6 mm) — L2's ≥0.7
   correlation grouping already enforces contiguity, so the feature is redundant two layers downstream.
-- **Lead the L4 writeup with this: narrow-field IEDs are 6/13 in all nine arms.** Not size, not channel
-  count, not binning, not contiguity, not prominence. A well-evidenced negative, and the honest
-  counterweight to a doubled PR-AUC.
+- **Lead the L4 writeup with this: narrow-field IEDs move only 6/13 → 7/13 across ~20 arms** (the single
+  gain is `dipole`). Not size, not channel count, not binning, not contiguity, not prominence, not
+  symmetry. Their L3 scores are 0.18–0.76, so **L4 cannot reach them** — this is §8 B (shape vs size), an
+  L3 problem. At n=13 no fix is statistically distinguishable, so **Kural cannot settle the focal case**.
+  A well-evidenced negative, and the honest counterweight to a doubled PR-AUC.
 
 ---
 
@@ -402,8 +441,10 @@ bad_soft_factor=3.0; bad_hard_factor=10.0; bad_flat_uv=0.5; max_interpolate=2
 classifier_halfwin_s=1.0; normalise_amplitude=True; centre_on='amplitude'
 polarity_feature=True; polarity_ms=20.0
 registration='elastic'; n_basis=70; penalty=0.1; n_components=24; lr_C=1.0; hard_neg_ratio=0.0
+spatial_feature=True   (L4: LR over L3 score + n_channels; operating point 0.775, not 0.80)
 n_reg_points=100
-hit_tol_ms=100; n_test=10; split_seed=0
+hit_tol_ms=100; n_test=0 (NO holdout since 2026-08-26 — all 100 train, 54 IEDs); split_seed=0
+fp_budget=10.0   (moved out of detect_metrics.FP_BUDGET into Config, 2026-08-26)
 ```
 **`detect_model.joblib` is current and shippable — re-verified 2026-08-18.** All 32 Config fields present
 (`sfreq=250`, `bandpass=(0.5,45)`, `reference='average'`, `grouping='components'`, `registration='elastic'`,
@@ -424,7 +465,11 @@ The `'shift'` branch is kept as a re-runnable ablation; don't delete it, and don
 
 ## 7. Leakage discipline (the user is strict about this)
 
-- Recording-level split (`stratified_split`, seed 0), whole recordings in/out.
+- **NO holdout since 2026-08-26** (`cfg.n_test=0`): all 100 recordings train, and the grouped CV over 54
+  IEDs is the only performance estimate. The user's call — 5 test IEDs moved in steps of 0.2 and were
+  never trusted. **Consequence to declare in the writeup: ~20 L4 arms and the L3 hyperparameters were
+  selected on this CV and nothing independent now checks that optimism.**
+- Recording-level CV folds (grouped by recording), whole recordings in/out.
 - **Everything fitted on the 90 only:** L1 threshold, `corr_threshold`, L3 (registration template, FPCA
   basis, scaler, LR weights), and hard-negative selection. L2/L3 training candidates come only from the 90.
 - Anything label-derived and *fitted* (registration template, FPCA basis, mined negatives) must be fitted
