@@ -1883,3 +1883,79 @@ channels of per-channel MAD). Grouped CV, 90-train, everything else unchanged:
   result here is real but is **not** evidence that the detector localises IEDs.
 - **Plan:** send a 5-recording-per-group validation run first (10 min of his time, shakes out montage /
   sampling rate / runtime), then the full run with the tuned model.
+
+---
+
+## 10. Montage widened: 19 -> 25 electrodes (2026-09-10)
+
+The cascade had been running on the 19 standard 10-20 electrodes. Kural's EDFs actually carry **25** —
+the 19 plus the extended inferior-temporal chain `F9/F10 T9/T10 P9/P10` — so six channels of real signal
+were being discarded at load. Fixed. **No pipeline logic changed**: the extra electrodes simply enter
+preprocessing and flow through L1, L2, L3 and L4 like any other channel.
+
+**Which recordings have what.** 97 of 100 carry all 25. **S33, S65 and S96 carry only the standard 19**
+(header scan, all 100 files). That fact is now asserted in `detect_data._selfcheck` rather than assumed.
+
+**Absent electrodes are not bad channels.** A bad channel has signal that is wrong and can be repaired
+from its neighbours; an absent electrode has no signal at all, so interpolating one would be invention.
+They are therefore left as **zero rows** in the canonical 25-row array and never touch
+`interpolate_bads`. The design point: a zero row has zero sharpness, so `find_peaks(height=6)` returns
+nothing and it **generates no L1 candidate** — the same inertness guarantee interpolated channels are
+given, reached with no special case and no new argument threaded through the cascade. It cannot join an
+event, satisfy `min_channels`, inflate `n_channels` or enter a spatial feature.
+
+Exactly **one** place had to be told, and it is the one that would have failed silently:
+`DetectionPipeline.background` is the median over channels of per-channel MAD, so six zero rows out of 25
+would have pulled the median down to roughly the 37th percentile of the real channels — quietly shrinking
+the divisor for those three recordings and making the amplitude normalisation mean something *different*
+there. It now takes the median over non-zero-MAD channels. Asserted: `background(X) ==
+background(X[present])`.
+
+**Trust boundary, kept but split.** `match_channels` still refuses a missing / ambiguous / bipolar
+montage, but "missing" now means one of the **required 19**; the extended six are optional and their
+absence is reported (`bads['absent']`) rather than raised. This is a transfer property as much as a Kural
+one — plenty of clinical files are plain 10-20, and they still load.
+
+**Front-end gates, re-measured over all 100 recordings / 54 IEDs:**
+
+| | 19 electrodes | 25 electrodes |
+|---|---|---|
+| L1 recall | 1.0000 | **1.0000** |
+| L2 recall | 0.9796 | **1.0000** |
+| candidate windows | 4,157 (90-train) | 5,519 (all 100) |
+| positives | 60 (90-train) | 72 (all 100) |
+| channels per event | 5.15 | 5.85 |
+| events / min | ~262 | 262.2 |
+
+L2 recall reaching 1.00 is the notable one: **S26, the single L2 miss, is now carried.** It was never a
+grouping failure — §4 Phase 1 diagnosed it as representative selection landing on the after-going slow
+wave, +200 ms off the marker, with the discharge itself captured. The temporal chain gives that event
+better-timed members, so the representative now lands inside tolerance. That closes deferred item **I**
+*on this dataset*; the underlying coupling of an event's time to its max-peak-to-peak channel is
+untouched, so the argument for decoupling them still stands on its own merits.
+
+**Everything downstream of L2 is now unmeasured.** The candidate pool grew ~33% and events are wider, so
+`n_channels` — the feature that carried the entire L4 gain — has a different distribution. **Every FROC
+number in §4, the `score >= 0.784` operating point, and `pilot.py`'s threshold are owed a fresh grouped
+CV.** Nothing was re-tuned to compensate and nothing should be until that CV is run.
+
+- **Worth pre-specifying before looking:** the L4 writeup's central negative is that narrow-field IEDs
+  move only 6/13 -> 7/13 across ~20 arms. The temporal chain is where a *focal* temporal discharge should
+  show up, so if the extra electrodes help anywhere it should be exactly there. Predict it now, then
+  check the narrow subgroup — otherwise a movement in that subgroup is unfalsifiable after the fact.
+- Counter-prediction, equally worth writing down: `F9/F10 T9/T10 P9/P10` are the electrodes most exposed
+  to temporalis EMG and eye movement, so they may add mimics faster than they add IEDs. FP/min at fixed
+  sensitivity is the number that would show it.
+
+**`detect_model.joblib` is refused, deliberately.** L4's `n_channels` and `dipole` are relative to the
+montage, and the electrode count is not in `Config`, so the §8 stale-model guard would not have caught
+this — a 19-electrode model would have scored 25-channel events and produced plausible, wrong output
+without failing. `save()` now stores `n_electrodes` and `load()` raises when it disagrees, defaulting a
+file that lacks the field to 19 (which is what such files are). The shipped model must be refit.
+
+**Code.** `CH19` / `CH19_ELECTRODES` / `STD19` are gone, replaced by `STD_NAMES` (standard_1020 spelling,
+the montage/position lookup), `ELECTRODES` (its uppercase form, the canonical index space) and
+`N_REQUIRED = 19`. `HOMOLOGOUS` gains the three extended L/R pairs. `match_channels` returns
+`(names, indices)`. `load_recording_path` returns `bads['absent']`; `load_dataset` carries it as
+`absent`; `predict.py` prints it and `pilot.py` writes `channels_matched` (a real count now, not the
+hard-coded 19) and a new `channels_absent` column.

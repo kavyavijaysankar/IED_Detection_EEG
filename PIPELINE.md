@@ -25,12 +25,13 @@ training.
 
 | step | setting | why |
 |---|---|---|
-| channel matching | 19 standard 10-20 electrodes | Present in all recordings. Names are normalised (`EEG Fp1-REF`, `Fp1-A1`, `E FP1-Ref` all map to `FP1`) and the old `T3/T4/T5/T6` nomenclature is aliased to `T7/T8/P7/P8`, so clinical files from any site load without editing. Matching is **exact after normalisation**, never by substring, so an extended array's `FC3` cannot masquerade as `C3`. |
+| channel matching | 25 electrodes: the standard 19, **required**, plus the extended inferior-temporal chain `F9/F10 T9/T10 P9/P10`, **optional** | Names are normalised (`EEG Fp1-REF`, `Fp1-A1`, `E FP1-Ref` all map to `FP1`) and the old `T3/T4/T5/T6` nomenclature is aliased to `T7/T8/P7/P8`, so clinical files from any site load without editing. Matching is **exact after normalisation**, never by substring, so an extended array's `FC3` cannot masquerade as `C3`. The 19 are present in every recording and a file missing one is refused; the extended six are not universal (3 Kural recordings lack them) and a file without them still loads. |
+| absent electrodes | left as a zero row, **never reconstructed** | An electrode the file does not carry is not a bad channel — there is no signal to repair, so interpolating one would be invention rather than reconstruction. A zero row has zero sharpness and so generates no L1 candidate, which is the same inertness guarantee interpolated channels get, reached without any special case. The single place that has to know is `DetectionPipeline.background`, which excludes zero-MAD channels so the amplitude normalisation still means the same thing. |
 | bandpass | 0.5–45 Hz, zero-phase | 0.5 Hz preserves the after-going slow wave, which is part of the discharge. 45 Hz already excludes 50 and 60 Hz mains, so no notch is needed. Zero-phase so spike timing and shape are preserved. Applied **before** resampling, so the anti-aliasing step has nothing left to remove. |
 | resample | 250 Hz | Sufficient for a 20–70 ms spike, and halves every downstream cost. All windows are specified in **milliseconds** and converted with `cfg.samp()`, so the cascade means the same thing at any input rate. |
 | bad channels | MAD > 3× median → soft; MAD > 10× or peak-to-peak < 0.5 µV → hard | Two thresholds because the costs are asymmetric. Excluding a channel from the average reference is nearly free if wrong; interpolating destroys real data, so that threshold is far above clean variation. "Dead" is tested on peak-to-peak, never on MAD — a quiet channel near the reference has tiny MAD but perfectly good signal. |
 | reference | average, over the good channels only | A recorded reference differs between labs; an average reference does not. This is the choice that transfers. |
-| interpolation | spherical spline, at most 2 channels | Beyond two of nineteen, reconstruction is fiction. Over the cap the recording is still processed — all bad channels are demoted to soft and the recording is flagged. |
+| interpolation | spherical spline, at most 2 channels | Beyond two, reconstruction is fiction. Over the cap the recording is still processed — all bad channels are demoted to soft and the recording is flagged. |
 
 **Interpolated channels generate no L1 candidates.** That single rule is the enforcement point for
 "reconstructed data is not evidence": with no candidates, such a channel can never join an event, satisfy
@@ -148,7 +149,13 @@ Results are reported as **hits, misses and false positives**. Correct rejections
 counted: over continuous EEG there is no meaningful number of "non-events", and ~98.5% of candidates are
 trivially negative, so specificity and accuracy would be inflated to the point of meaninglessness.
 
-**Current cross-validated performance** (49 IEDs, out-of-fold):
+> **The table below predates the move from 19 to 25 electrodes and has not been re-measured.** The
+> candidate pool grew from 4,157 windows to 5,519 and events span 5.85 channels instead of 5.15, so every
+> FROC number, and the `score >= 0.784` operating point derived from it, is owed a fresh grouped CV. What
+> has been re-measured is the front end: **L1 recall 1.00, L2 recall 1.00** over all 54 IEDs (L2 was
+> 0.98 — S26, the one representative-selection miss, is now carried).
+
+**Cross-validated performance at 19 electrodes** (49 IEDs, out-of-fold):
 
 | | |
 |---|---|

@@ -8,11 +8,14 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from detect_config import Config
 
-CH19 = ['E C3-Ref', 'E C4-Ref', 'E Cz-Ref', 'E F3-Ref', 'E F4-Ref', 'E F7-Ref', 'E F8-Ref',
-        'E FP1-Ref', 'E FP2-Ref', 'E Fz-Ref', 'E O1-Ref', 'E O2-Ref', 'E P3-Ref', 'E P4-Ref',
-        'E P7-Ref', 'E P8-Ref', 'E Pz-Ref', 'E T7-Ref', 'E T8-Ref']
-
-STD19 = [{'FP1': 'Fp1', 'FP2': 'Fp2'}.get(c[2:-4], c[2:-4]) for c in CH19]
+# The canonical channel index space, in standard_1020 spelling. The first N_REQUIRED are the standard
+# 10-20 array and every recording must have them; the rest are the extended inferior-temporal chain,
+# which a file may simply not carry (3 Kural recordings do not). An absent electrode is left as a zero
+# row rather than reconstructed — see load_recording_path.
+STD_NAMES = ['C3', 'C4', 'Cz', 'F3', 'F4', 'F7', 'F8', 'Fp1', 'Fp2', 'Fz', 'O1', 'O2',
+             'P3', 'P4', 'P7', 'P8', 'Pz', 'T7', 'T8',
+             'F9', 'F10', 'P9', 'P10', 'T9', 'T10']
+N_REQUIRED = 19
 
 _ALIAS = {'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8'} # old 10-20 nomenclature
 
@@ -24,26 +27,31 @@ def electrode(name):
     return _ALIAS.get(s, s)
 
 
-CH19_ELECTRODES = [electrode(c) for c in CH19]
+ELECTRODES = [n.upper() for n in STD_NAMES]
 
-# left/right homologous pairs as CH19 indices; the midline (Fz, Cz, Pz) has no mirror and is excluded
-HOMOLOGOUS = [(CH19_ELECTRODES.index(l), CH19_ELECTRODES.index(r)) for l, r in
+# left/right homologous pairs as ELECTRODES indices; the midline (Fz, Cz, Pz) has no mirror
+HOMOLOGOUS = [(ELECTRODES.index(l), ELECTRODES.index(r)) for l, r in
               (('FP1', 'FP2'), ('F3', 'F4'), ('F7', 'F8'), ('C3', 'C4'),
-               ('P3', 'P4'), ('P7', 'P8'), ('T7', 'T8'), ('O1', 'O2'))]
+               ('P3', 'P4'), ('P7', 'P8'), ('T7', 'T8'), ('O1', 'O2'),
+               ('F9', 'F10'), ('P9', 'P10'), ('T9', 'T10'))]
 
 
 def _is_bipolar(name):
     """True for a bipolar derivation ('F7-T3'), False for a referential channel ('Fp1-A1')."""
     parts = re.split(r'[-_]', name.upper().replace(' ', ''))
-    return len(parts) > 1 and _ALIAS.get(parts[1], parts[1]) in CH19_ELECTRODES
+    return len(parts) > 1 and _ALIAS.get(parts[1], parts[1]) in ELECTRODES
 
 
 def match_channels(ch_names):
-    """The file's own names for our 19 electrodes, in CH19 order; raises on missing/ambiguous/bipolar."""
+    """(the file's own names for the electrodes it carries, their ELECTRODES indices), both ascending.
+
+    The standard 19 are required; the extended electrodes are optional and simply absent when the file
+    has none. Raises on a missing standard electrode, an ambiguous name or a bipolar montage.
+    """
     found = {}
     for n in ch_names:
         e = electrode(n)
-        if e in CH19_ELECTRODES:
+        if e in ELECTRODES:
             found.setdefault(e, []).append(n)
     bipolar = [n for v in found.values() for n in v if _is_bipolar(n)]
     if bipolar:
@@ -53,16 +61,17 @@ def match_channels(ch_names):
     if dup:
         raise ValueError(f"ambiguous channels — one electrode named twice, possibly under different "
                          f"references: {dup}")
-    missing = [e for e in CH19_ELECTRODES if e not in found]
+    missing = [e for e in ELECTRODES[:N_REQUIRED] if e not in found]
     if missing:
         raise ValueError(f"missing electrodes {missing}. File contains: {list(ch_names)}")
-    return [found[e][0] for e in CH19_ELECTRODES]
+    present = [i for i, e in enumerate(ELECTRODES) if e in found]
+    return [found[ELECTRODES[i]][0] for i in present], present
 
 
 def electrode_positions():
-    """(19, 3) electrode coordinates in mm, in CH19 order, from the standard_1020 montage."""
+    """(n, 3) electrode coordinates in mm, in ELECTRODES order, from the standard_1020 montage."""
     pos = mne.channels.make_standard_montage('standard_1020').get_positions()['ch_pos']
-    return np.array([pos[c] for c in STD19]) * 1000.0
+    return np.array([pos[c] for c in STD_NAMES]) * 1000.0
 
 
 def bad_channels(X, cfg):
@@ -88,9 +97,11 @@ def load_recording_path(edf_path, cfg=None):
         raise ValueError(f"unknown reference: {cfg.reference}")
 
     raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
-    raw.pick(match_channels(raw.ch_names)) # pick() also reorders, so indices are canonical
-    raw.rename_channels(dict(zip(raw.ch_names, STD19)))
-    assert raw.ch_names == STD19, f"channel order not canonical after pick: {raw.ch_names}"
+    names, present = match_channels(raw.ch_names)
+    raw.pick(names) # pick() also reorders, so indices are canonical
+    std = [STD_NAMES[i] for i in present]
+    raw.rename_channels(dict(zip(raw.ch_names, std)))
+    assert raw.ch_names == std, f"channel order not canonical after pick: {raw.ch_names}"
     raw.set_montage('standard_1020', match_case=False, verbose=False)   # positions, for interpolation
     if cfg.bandpass: # filter BEFORE resampling (mne's recommended order), so
         lo, hi = cfg.bandpass # the anti-aliasing step then has nothing left to remove
@@ -98,15 +109,25 @@ def load_recording_path(edf_path, cfg=None):
     if raw.info['sfreq'] != cfg.sfreq: # guarded, so same-rate files are provably untouched
         raw.resample(cfg.sfreq, verbose=False) # mne low-passes before decimating (anti-aliasing)
 
-    soft, hard, over_cap, mad_ratio = bad_channels(raw.get_data() * 1e6, cfg)
+    soft, hard, over_cap, ratio = bad_channels(raw.get_data() * 1e6, cfg)   # indices into `present`
     if cfg.reference == 'average': # average over the GOOD channels only, so a bad electrode
-        keep = [STD19[i] for i in range(len(STD19)) if i not in set(soft) | set(hard)]
+        keep = [std[i] for i in range(len(std)) if i not in set(soft) | set(hard)]
         raw.set_eeg_reference(ref_channels=keep, verbose=False)
     if hard: # interpolate after re-referencing, so the reconstruction is
-        raw.info['bads'] = [STD19[i] for i in hard] # consistent with the channels it is built from
+        raw.info['bads'] = [std[i] for i in hard] # consistent with the channels it is built from
         raw.interpolate_bads(reset_bads=False, verbose=False)
-    return raw.get_data() * 1e6, {'soft': soft, 'hard': hard, 'over_cap': over_cap,
-                                  'mad_ratio': mad_ratio}
+
+    # Expand to the canonical index space. An electrode the file does not carry stays a ZERO row: it is
+    # never reconstructed, and a flat channel yields no L1 candidates (sharpness 0 < l1_threshold), so it
+    # cannot join an event, satisfy min_channels or enter a spatial feature. Same guarantee as an
+    # interpolated channel, with no plumbing — the only place that has to know is background().
+    X = np.zeros((len(ELECTRODES), raw.n_times))
+    X[present] = raw.get_data() * 1e6
+    mad_ratio = np.full(len(ELECTRODES), np.nan)
+    mad_ratio[present] = ratio
+    return X, {'soft': [present[i] for i in soft], 'hard': [present[i] for i in hard],
+               'over_cap': over_cap, 'mad_ratio': mad_ratio,
+               'absent': sorted(set(range(len(ELECTRODES))) - set(present))}
 
 
 def load_recording(file_id, edf_dir, cfg=None):
@@ -121,7 +142,8 @@ def load_dataset(manifest, edf_dir, cfg=None):
         X, bads = load_recording(r['file_id'], edf_dir, cfg)
         out.append(dict(fid=r['file_id'], X=X, mk=int(round(r['transient_onset_s'] * cfg.sfreq)),
                         epi=bool(r['label_binary']), cert=r['certainty'], dur=X.shape[1] / cfg.sfreq,
-                        bad_soft=bads['soft'], bad_hard=bads['hard'], bad_over_cap=bads['over_cap']))
+                        bad_soft=bads['soft'], bad_hard=bads['hard'], bad_over_cap=bads['over_cap'],
+                        absent=bads['absent']))
     return out
 
 
@@ -161,15 +183,18 @@ def _selfcheck():
     assert electrode('E FP1-Ref') == electrode('EEG Fp1-REF') == electrode('Fp1-A1') == 'FP1'
     assert electrode('EEG T3-LE') == 'T7' and electrode('T6') == 'P8', "old 10-20 names must alias"
     assert electrode('FC3') == 'FC3' and electrode('TP7') == 'TP7', "extended array must not collide"
-    assert electrode('P EKG') not in CH19_ELECTRODES, "a non-EEG channel must match no electrode"
-    assert match_channels(CH19) == CH19, "Kural's own names must still match, in order"
+    assert electrode('P EKG') not in ELECTRODES, "a non-EEG channel must match no electrode"
+    kural = [f"E {e.replace('FP', 'Fp').replace('Z', 'z')}-Ref" for e in ELECTRODES]
+    assert match_channels(kural) == (kural, list(range(len(ELECTRODES)))), \
+        "Kural's own names must still match, in order"
     old = {'T7': 'T3', 'T8': 'T4', 'P7': 'T5', 'P8': 'T6'}
-    clinical = [f"EEG {old.get(e, e).title()}-REF" for e in CH19_ELECTRODES]
-    assert match_channels(list(reversed(clinical)) + ['P EKG', 'EEG A1-REF']) == clinical, \
-        "must return the 19 in CH19 order whatever the file's order, ignoring extra channels"
+    clinical = [f"EEG {old.get(e, e).title()}-REF" for e in ELECTRODES]
+    assert match_channels(list(reversed(clinical)) + ['P EKG', 'EEG A1-REF']) == \
+        (clinical, list(range(len(ELECTRODES)))), \
+        "must return every electrode in canonical order whatever the file's order, ignoring extras"
     assert _is_bipolar('F7-T3') and _is_bipolar('EEG C3-Cz'), "bipolar derivations must be spotted"
     assert not _is_bipolar('Fp1-A1') and not _is_bipolar('E FP1-Ref'), "referential ones must not be"
-    chain = [f"{a}-{b}" for a, b in zip(CH19_ELECTRODES, CH19_ELECTRODES[1:] + CH19_ELECTRODES[:1])]
+    chain = [f"{a}-{b}" for a, b in zip(ELECTRODES, ELECTRODES[1:] + ELECTRODES[:1])]
     for bad_list, word in ((clinical[1:], 'missing'), (clinical + ['Fp1-A2'], 'ambiguous'),
                            (chain, 'bipolar')):
         try:
@@ -178,13 +203,23 @@ def _selfcheck():
         except ValueError as ex:
             assert word in str(ex), f"unhelpful {word} error: {ex}"
 
+    # the extended electrodes are OPTIONAL: a file without them loads, one without a standard 10-20
+    # electrode is still refused. This is what lets the 3 Kural recordings that lack them through.
+    core = clinical[:N_REQUIRED]
+    assert match_channels(core) == (core, list(range(N_REQUIRED))), \
+        "a standard-19 file must load, with the extended electrodes simply absent"
+    for one in ELECTRODES[N_REQUIRED:]:
+        names = [n for n in clinical if electrode(n) != one]
+        assert len(match_channels(names)[1]) == len(ELECTRODES) - 1, f"{one} should be optional"
+
     rec_dir = root / 'Kural_Dataset' / 'Recordings'
     from dataclasses import replace
     cfg = Config()
     fid0 = te['file_id'].iloc[0]
     X, bads = load_recording(fid0, rec_dir, cfg)
-    assert X.shape[0] == 19, "expected 19 channels"
-    assert set(bads) == {'soft', 'hard', 'over_cap', 'mad_ratio'}, "loader must report the bad-channel split"
+    assert X.shape[0] == len(ELECTRODES), f"expected {len(ELECTRODES)} channels, got {X.shape[0]}"
+    assert set(bads) == {'soft', 'hard', 'over_cap', 'mad_ratio', 'absent'}, \
+        "loader must report the bad-channel split and which electrodes the file lacked"
 
     rng = np.random.default_rng(0)
     B = rng.normal(0, 8, (19, 4000))
@@ -207,7 +242,8 @@ def _selfcheck():
 
     # average reference is taken over the good channels only, so it zero-sums over exactly those
     Xa, ba = load_recording(fid0, rec_dir, replace(cfg, reference='average'))
-    keep = [i for i in range(19) if i not in set(ba['soft']) | set(ba['hard'])]
+    keep = [i for i in range(len(ELECTRODES))
+            if i not in set(ba['soft']) | set(ba['hard']) | set(ba['absent'])]
     assert np.allclose(Xa[keep].mean(0), 0, atol=1e-9), "average must zero-sum over the unflagged channels"
 
     # preprocessing is driven by cfg alone. Written rate-explicitly so it does not silently pass or fail
@@ -229,22 +265,43 @@ def _selfcheck():
     assert pw(bp500, 4, 30) > 0.7 * pw(raw500, 4, 30), "passband should be largely preserved"
 
     pos = electrode_positions()
-    ix = {e: i for i, e in enumerate(CH19_ELECTRODES)}
+    ix = {e: i for i, e in enumerate(ELECTRODES)}
     d = lambda a, b: float(np.linalg.norm(pos[ix[a]] - pos[ix[b]]))
-    assert pos.shape == (19, 3), "expected 19 3-D electrode positions"
+    assert pos.shape == (len(ELECTRODES), 3), f"expected {len(ELECTRODES)} 3-D electrode positions"
     assert d('FP1', 'O1') > d('FP1', 'F3'), "front-to-back must exceed a neighbouring pair"
     assert abs(d('C3', 'CZ') - d('C4', 'CZ')) < 3.0, "left/right must mirror (the template is not exact)"
     assert 20 < d('F7', 'T7') < 90, f"adjacent electrodes should be tens of mm apart, got {d('F7','T7'):.0f}"
-    assert len(HOMOLOGOUS) == 8 and len({i for p in HOMOLOGOUS for i in p}) == 16, "8 disjoint L/R pairs"
+    assert d('T9', 'T7') < d('T9', 'T8'), "T9 sits below T7, not across the head"
+    assert len(HOMOLOGOUS) == 11 and len({i for p in HOMOLOGOUS for i in p}) == 22, \
+        "11 disjoint L/R pairs (8 standard + the 3 extended)"
     for li, ri in HOMOLOGOUS:
         assert pos[li][0] < 0 < pos[ri][0], \
-            f"{CH19_ELECTRODES[li]}/{CH19_ELECTRODES[ri]} are not a left/right pair"
+            f"{ELECTRODES[li]}/{ELECTRODES[ri]} are not a left/right pair"
         assert abs(abs(pos[li][0]) - abs(pos[ri][0])) < 8.0, "homologues should mirror across the midline"
+
+    # A file missing extended electrodes loads with zero rows in their place: never reconstructed, and
+    # inert downstream because a flat channel's sharpness is 0 and so yields no L1 candidate.
+    from detect_stage1 import channel_stat
+    short = [f for f in man['file_id']
+             if len(match_channels(mne.io.read_raw_edf(str(rec_dir / f"{f}.edf"), preload=False,
+                                                       verbose=False).ch_names)[1]) < len(ELECTRODES)]
+    assert short, "expected some Kural recordings to lack the extended electrodes"
+    Xs_, bs_ = load_recording(short[0], rec_dir, cfg)
+    assert bs_['absent'] and not (set(bs_['absent']) & set(bs_['hard'])), \
+        "an absent electrode must never be interpolated"
+    assert np.all(Xs_[bs_['absent']] == 0), "absent electrodes must be left as zero rows"
+    assert channel_stat(Xs_, cfg)[bs_['absent']].max() < cfg.l1_threshold, \
+        "a zero row must never reach the L1 threshold"
+    present = [i for i in range(len(ELECTRODES)) if i not in set(bs_['absent'])]
+    from detection import DetectionPipeline
+    assert DetectionPipeline.background(Xs_) == DetectionPipeline.background(Xs_[present]), \
+        "background amplitude must ignore the absent channels, not average them in"
 
     assert window_around(np.arange(100), 5, 10) is None, "edge window should be rejected"
     assert len(window_around(np.arange(100), 50, 10)) == 20, "window length wrong"
 
     print(f"selfcheck OK  |  train={len(tr)} test={len(te)}  |  "
+          f"{len(ELECTRODES)} electrodes, {len(short)} recordings missing some  |  "
           f"test certainty={te['certainty'].value_counts().to_dict()}")
 
 

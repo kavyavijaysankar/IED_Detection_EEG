@@ -6,3 +6,5 @@ mne==1.8.0
 pandas==2.3.3
 joblib==1.5.3
 multimethod==2.0.2
+matplotlib==3.9.4
+fdasrsf==2.6.1

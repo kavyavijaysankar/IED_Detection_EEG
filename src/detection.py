@@ -14,7 +14,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold, cross_val_predict
 
 from detect_config import Config
-from detect_data import HOMOLOGOUS, electrode_positions, window_around
+from detect_data import ELECTRODES, HOMOLOGOUS, electrode_positions, window_around
 from detect_stage1 import channel_stat, candidates
 
 
@@ -370,9 +370,14 @@ class DetectionPipeline:
     @staticmethod
     def background(X):
         """Recording background amplitude: median over channels of each channel's MAD.
+
+        Channels with zero MAD are excluded: those are the electrodes the file did not carry, left as
+        zero rows by load_recording_path, and counting them would drag the median off the real channels
+        and so make the amplitude normalisation mean something different on such a recording.
         """
-        return max(float(np.median(np.median(np.abs(X - np.median(X, axis=1, keepdims=True)), axis=1))),
-                   1e-9)
+        mad = np.median(np.abs(X - np.median(X, axis=1, keepdims=True)), axis=1)
+        mad = mad[mad > 0]
+        return max(float(np.median(mad)), 1e-9) if len(mad) else 1e-9
 
     def _event_windows(self, X, bad=()):
         """Events with a valid 2 s window, paired with those windows (drops edge events).
@@ -448,7 +453,8 @@ class DetectionPipeline:
         return events
 
     def save(self, path):
-        joblib.dump({'cfg': self.cfg, 'classifier': self.classifier, 'l4': self.l4}, path)
+        joblib.dump({'cfg': self.cfg, 'classifier': self.classifier, 'l4': self.l4,
+                     'n_electrodes': len(ELECTRODES)}, path)
 
     @classmethod
     def load(cls, path):
@@ -460,6 +466,15 @@ class DetectionPipeline:
                 f"{path} was saved before Config gained {missing}, which would now silently take today's "
                 f"class defaults and change how this model preprocesses its input. Re-save the model from "
                 f"the run notebook, or check out the code it was trained with.")
+        # The montage is not in Config, so nothing above would catch it: L4's n_channels and dipole are
+        # scaled against the electrode count the model was fitted on, and would silently mean something
+        # else on a wider one. Files saved before this field existed are the 19-electrode generation.
+        n = d.get('n_electrodes', 19)
+        if n != len(ELECTRODES):
+            raise ValueError(
+                f"{path} was fitted on {n} electrodes but the pipeline now uses {len(ELECTRODES)}. L4's "
+                f"n_channels and dipole are relative to the montage, so the scores would be wrong "
+                f"without failing. Refit the model from the run notebook.")
         obj = cls(d['cfg'])
         obj.classifier = d['classifier']
         obj.l4 = d.get('l4')
@@ -549,10 +564,10 @@ def _demo():
     print("amplitude-normalisation demo OK")
 
     # L4 spatial features: geometry from real electrode positions, on events with a known layout
-    from detect_data import CH19_ELECTRODES, electrode_positions
+    from detect_data import ELECTRODES, electrode_positions
     pos = electrode_positions()
-    ix = {e: i for i, e in enumerate(CH19_ELECTRODES)}
-    Xf = np.zeros((19, 2000))
+    ix = {e: i for i, e in enumerate(ELECTRODES)}
+    Xf = np.zeros((len(ELECTRODES), 2000))
     for e, a in {'F7': 10.0, 'T7': 8.0, 'P7': 6.0, 'O2': 9.0}.items():
         Xf[ix[e]] += a * np.exp(-0.5 * ((np.arange(2000) - 1000) / 5.0) ** 2)
     ev = lambda els: {'members': [(ix[e], 1000) for e in els], 'channel': ix[els[0]]}
@@ -570,7 +585,7 @@ def _demo():
     # dipole / propagation / symmetry, each against the field that should and should not trigger it
     def field(spec, times=None):
         """spec: {electrode: signed amplitude}; times: {electrode: sample} (default all coincident)."""
-        Z = np.zeros((19, 2000))
+        Z = np.zeros((len(ELECTRODES), 2000))
         for e, a in spec.items():
             t = (times or {}).get(e, 1000)
             Z[ix[e]] += a * np.exp(-0.5 * ((np.arange(2000) - t) / 5.0) ** 2)
@@ -622,8 +637,14 @@ def _demo():
         raise AssertionError("a model whose cfg predates a Config field should be refused")
     except ValueError as ex:
         assert 'bandpass' in str(ex), f"the error must name the missing field: {ex}"
-    joblib.dump({'cfg': cfg, 'classifier': None}, path)
-    assert DetectionPipeline.load(path).cfg == cfg, "a complete cfg must still load"
+    joblib.dump({'cfg': cfg, 'classifier': None}, path)          # no n_electrodes -> the 19 generation
+    try:
+        DetectionPipeline.load(path)
+        raise AssertionError("a model fitted on a different montage should be refused")
+    except ValueError as ex:
+        assert '19 electrodes' in str(ex), f"the error must name the montage it was fitted on: {ex}"
+    joblib.dump({'cfg': cfg, 'classifier': None, 'n_electrodes': len(ELECTRODES)}, path)
+    assert DetectionPipeline.load(path).cfg == cfg, "a matching model must still load"
     print("stale-model guard demo OK")
 
 

@@ -148,13 +148,17 @@ def froc(pipe, recs):
     return froc_points(recs, E, G, pipe.classifier.predict_proba(W), pipe.cfg)
 
 
-def localisation_errors(recs, events, G, scores, cfg):
-    """|event time - marker| in ms per IED, using that IED's highest-scoring near-marker event."""
+def localisation_errors(recs, events, G, scores, cfg, signed=False):
+    """|event time - marker| in ms per IED, using that IED's highest-scoring near-marker event.
+
+    signed=True keeps the sign (event - marker): negative = the detector fired before the annotated peak.
+    """
     tol, best = cfg.samp(cfg.hit_tol_ms), {}
     for e, gk, s in zip(events, G, scores):
         r = recs[gk]
         if r['epi'] and abs(e['time'] - r['mk']) <= tol and s > best.get(gk, (-np.inf, 0))[0]:
-            best[gk] = (s, abs(e['time'] - r['mk']) / cfg.sfreq * 1000)
+            off = (e['time'] - r['mk']) / cfg.sfreq * 1000
+            best[gk] = (s, off if signed else abs(off))
     return np.array([v[1] for v in best.values()])
 
 

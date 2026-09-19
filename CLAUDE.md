@@ -74,10 +74,12 @@ in-distribution (it only ever sees consolidated candidate windows).
 ## 3. Current state — what's built & tested
 
 - **`src/detect_config.py`** — `Config` dataclass: every tunable in one place (§6). Imported everywhere.
-- **`src/detect_data.py`** — `CH19` (19 common 10-20 channels), `electrode`/`match_channels` (the
+- **`src/detect_data.py`** — `ELECTRODES` (**25**: the standard 19, required, + the extended chain
+  `F9/F10 T9/T10 P9/P10`, optional — see report.md §10, 2026-09-10) and `STD_NAMES`/`N_REQUIRED`,
+  `electrode`/`match_channels` (the
   external-data naming trust boundary: strips reference suffix + modality prefix, exact-matches, aliases
-  the old `T3/T4/T5/T6`, and **refuses** missing / ambiguous / bipolar montages — added 2026-08-18, see
-  report.md §9 pre-flight), `load_recording`/`load_recording_path`/
+  the old `T3/T4/T5/T6`, and **refuses** missing-required / ambiguous / bipolar montages — added
+  2026-08-18, see report.md §9 pre-flight; returns `(names, indices)`), `load_recording`/`load_recording_path`/
   `load_dataset` — all three take **`cfg`** (not a `reference` string) since Phase 0. `load_recording_path`
   is **the single preprocessing entry point**: everything applied to the signal before L1 goes there and
   nowhere else, driven entirely by `cfg`, so a run can't preprocess differently from training. Also
@@ -129,6 +131,15 @@ in-distribution (it only ever sees consolidated candidate windows).
 ---
 
 ## 4. Where the numbers stand
+
+> **STALE BELOW L2 as of 2026-09-10 (report.md §10).** The montage went 19 -> 25 electrodes (six channels
+> of real signal were being dropped at load). Front end re-measured and both gates pass: **L1 recall 1.00,
+> L2 recall 1.00** over 54 IEDs — S26 is now carried, so deferred item **I** is closed on this dataset.
+> But the pool grew 4,157 -> 5,519 windows and events widened 5.15 -> 5.85 channels, so **every FROC
+> number, every AUC, the 0.784 operating point and the pilot threshold below are owed a fresh grouped
+> CV**, and `n_channels` — the feature carrying the whole L4 gain — has a different distribution.
+> `detect_model.joblib` is now *refused* by `load` (new `n_electrodes` guard) and must be refit.
+> Nothing has been re-tuned; don't re-tune anything until that CV is run.
 
 **FINAL PIPELINE (2026-08-18):** 250 Hz · 0.5–45 Hz zero-phase bandpass · two-threshold bad channels ·
 average reference over good channels · `components`/0.7 · `normalise_amplitude` · polarity ON · elastic ·
@@ -446,7 +457,9 @@ n_reg_points=100
 hit_tol_ms=100; n_test=0 (NO holdout since 2026-08-26 — all 100 train, 54 IEDs); split_seed=0
 fp_budget=10.0   (moved out of detect_metrics.FP_BUDGET into Config, 2026-08-26)
 ```
-**`detect_model.joblib` is current and shippable — re-verified 2026-08-18.** All 32 Config fields present
+**`detect_model.joblib` is a 19-electrode model and `load` now REFUSES it (2026-09-10, report.md §10).**
+Refit before anything is shipped or quoted. The description below is the last verified state of that
+19-electrode file. All 32 Config fields present
 (`sfreq=250`, `bandpass=(0.5,45)`, `reference='average'`, `grouping='components'`, `registration='elastic'`,
 `normalise_amplitude=True`, `polarity_feature=True`), 25 features in both scaler and LR, FPCA k=24. The
 Phase 4 Restart & Run All is done; nothing is owed here.
@@ -499,6 +512,12 @@ The `'shift'` branch is kept as a re-runnable ablation; don't delete it, and don
     stored cfg's `__dict__` with the current `Config` fields and raises, naming what is missing. The
     shipped `detect_model.joblib` was verified to hold all 32 fields (250 Hz, average, 25 features), so it
     is safe to share. Keep the rule anyway — the guard stops a stale model, it does not fix one.
+  - **That guard was not enough, and 2026-09-10 proved it: the montage is not in `Config`.** Widening to
+    25 electrodes changes what L4's `n_channels` and `dipole` mean, and a 19-electrode model would have
+    scored 25-channel events into plausible, wrong output without raising anything. `save` now stores
+    `n_electrodes` and `load` raises on a mismatch (a file lacking the field is treated as 19).
+    **Generalised rule: anything that changes what a fitted feature MEANS needs its own guard, whether or
+    not it lives in `Config`.** Config-field equality is a proxy, not the invariant.
   - The polarity part of the earlier note was also wrong and is corrected: the saved model holds 25 features
     and `polarity_feature=True`, so it IS polarity-fitted.
 - **Amplitude statistics cannot measure warping — they are invariant to it by construction.** Time warping

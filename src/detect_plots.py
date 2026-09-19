@@ -139,3 +139,21 @@ def loc_error(ax, errs, cfg):
     ax.axvline(np.median(errs), color='C3', lw=1.2, label=f'median {np.median(errs):.0f} ms')
     ax.set_xlabel(f'|event - marker| (ms), capped at hit_tol={cfg.hit_tol_ms:.0f}')
     ax.set_ylabel('IEDs'); ax.legend(fontsize=8)
+
+
+def loc_offset(ax, offs, cfg, bin_ms=10):
+    """Signed localisation offset, event - marker, so early and late detections fall either side of 0.
+
+    `offs` from localisation_errors(..., signed=True). The range is +/-hit_tol by construction.
+    """
+    tol = cfg.hit_tol_ms
+    ax.hist(offs, bins=np.arange(-tol, tol + bin_ms, bin_ms), color='C0', alpha=0.8)
+    ax.axvline(0, color='k', ls=':', lw=1.4, label='IED marker')
+    ax.axvline(np.median(offs), color='C3', ls=':', lw=1.4, alpha=0.7,
+               label=f'median {np.median(offs):+.0f} ms')
+    ax.axvline(np.mean(offs), color='C1', ls=':', lw=1.4, alpha=0.7,
+               label=f'mean {np.mean(offs):+.0f} ms')
+    ax.set_xlim(-tol, tol)
+    ax.set_xlabel('Deviation from IED marker in ms')
+    ax.set_ylabel('Number of IEDs')
+    ax.legend(fontsize=8)

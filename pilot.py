@@ -11,12 +11,12 @@ import numpy as np
 warnings.filterwarnings('ignore', message='Invalid measurement date')
 
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
-from detect_data import CH19_ELECTRODES, electrode_positions, load_recording_path, match_channels
+from detect_data import ELECTRODES, electrode_positions, load_recording_path, match_channels
 from detection import DetectionPipeline, _smooth, member_sign, member_ptp, spatial_features
 
 THRESHOLD = 0.766   # pre-registered <=10 FP/min operating point from grouped CV
 
-REC_COLS = ['file', 'folder', 'duration_s', 'input_sfreq', 'channels_matched', 'error',
+REC_COLS = ['file', 'folder', 'duration_s', 'input_sfreq', 'channels_matched', 'channels_absent', 'error',
             'n_candidates', 'n_events', 'n_above_thr', 'threshold',
             'q90', 'q95', 'q99', 'n_above_0.5', 'n_above_0.7', 'n_above_0.9',
             'background_uv', 'p99_abs_uv', 'bad_soft', 'bad_hard', 'over_cap', 'mad_ratio']
@@ -50,8 +50,7 @@ def check(files):
             print(f"{path.name:<28} {'-':>7} {'-':>8}  UNREADABLE: {ex}")
             continue
         try:
-            match_channels(names)
-            note, good = 'OK (19 matched)', True
+            note, good = f"OK ({len(match_channels(names)[0])} of {len(ELECTRODES)} matched)", True
         except ValueError as ex:
             note, good = f"FAIL: {ex}", False
         ok += good
@@ -75,11 +74,11 @@ def scan(pipe, path, folder, threshold):
         # structure recoverable offline — L2 groups on |correlation| and would otherwise discard it.
         ms = sorted(zip(e['members'], member_ptp(e['members'], Xs, pipe.cfg),
                         member_sign(e['members'], Xs, pipe.cfg)), key=lambda m: m[0][1])
-        members = [f"{CH19_ELECTRODES[c]}@{t / pipe.cfg.sfreq:.3f}:{p:.1f}:{s:+.0f}"
+        members = [f"{ELECTRODES[c]}@{t / pipe.cfg.sfreq:.3f}:{p:.1f}:{s:+.0f}"
                    for (c, t), p, s in ms]
         rows.append({'file': path.name, 'folder': folder,
                      'time_s': round(e['time'] / pipe.cfg.sfreq, 4),
-                     'channel': CH19_ELECTRODES[e['channel']], 'members': ';'.join(members),
+                     'channel': ELECTRODES[e['channel']], 'members': ';'.join(members),
                      'n_channels': e['n_channels'], 'score': round(e['score'], 6),
                      'l3_score': round(e['l3_score'], 6),
                      'dipole': round(spatial_features(e, Xs, pipe.cfg, pos)['dipole'], 4),
@@ -88,9 +87,10 @@ def scan(pipe, path, folder, threshold):
 
     s = np.array([e['score'] for e in events])
     q = lambda p: round(float(np.quantile(s, p)), 6) if len(s) else ''
-    name = lambda idx: ';'.join(CH19_ELECTRODES[i] for i in idx)
+    name = lambda idx: ';'.join(ELECTRODES[i] for i in idx)
     rec = {'file': path.name, 'folder': folder, 'duration_s': round(X.shape[1] / pipe.cfg.sfreq, 3),
-           'input_sfreq': sfreq_in, 'channels_matched': 19, 'error': '',
+           'input_sfreq': sfreq_in, 'channels_matched': len(ELECTRODES) - len(bads['absent']),
+           'channels_absent': name(bads['absent']), 'error': '',
            'n_candidates': len(cands), 'n_events': len(events),
            'n_above_thr': int((s >= threshold).sum()), 'threshold': threshold,
            'q90': q(0.90), 'q95': q(0.95), 'q99': q(0.99),
@@ -180,18 +180,21 @@ def selfcheck(model):
         s = np.array([float(e['score']) for e in evs if e['file'] == r['file']])
         assert int(r['n_above_thr']) == int((s >= thr).sum()), f"{r['file']}: n_above_thr disagrees"
         assert abs(float(r['q99']) - np.quantile(s, 0.99)) < 1e-5, f"{r['file']}: q99 disagrees"
-        assert len(r['mad_ratio'].split(';')) == 19, "mad_ratio must carry all 19 channels"
+        assert len(r['mad_ratio'].split(';')) == len(ELECTRODES), "mad_ratio must carry every channel"
+        assert int(r['channels_matched']) + len(r['channels_absent'].split(';') if
+                                                r['channels_absent'] else []) == len(ELECTRODES), \
+            "matched + absent must account for the whole canonical montage"
         assert float(r['duration_s']) > 0 and float(r['background_uv']) > 0
     for e in evs:
         assert e['folder'] in ('a', 'b'), f"bad folder label {e['folder']}"
-        assert e['channel'] in CH19_ELECTRODES, f"bad electrode label {e['channel']}"
+        assert e['channel'] in ELECTRODES, f"bad electrode label {e['channel']}"
         assert e['polarity'] in ('-1', '1', '0'), f"bad polarity {e['polarity']}"
         assert -1.0 <= float(e['dipole']) <= 1.0, f"dipole out of range: {e['dipole']}"
         parts = e['members'].split(';')
         assert len(parts) >= int(e['n_channels']), "members must cover at least n_channels"
         for m in parts:
             el, _, rest = m.partition('@')
-            assert el in CH19_ELECTRODES and len(rest.split(':')) == 3, f"malformed member {m}"
+            assert el in ELECTRODES and len(rest.split(':')) == 3, f"malformed member {m}"
     shutil.rmtree(tmp)
     print(f"\npilot selfcheck OK  |  {len(good)} scanned, 1 error row, {len(evs)} events")
 
